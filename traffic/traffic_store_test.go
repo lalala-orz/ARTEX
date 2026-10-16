@@ -54,6 +54,10 @@ func openTraffic(t *testing.T) (*Traffic, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Store tests assert right after recording, so they take the synchronous path:
+	// nil recCh means record inline. The queued path is covered separately by
+	// TestRecordingIsAsyncAndDrainsOnClose.
+	tr.recCh = nil
 	t.Cleanup(func() { tr.Close() })
 	return tr, dir
 }
@@ -73,7 +77,7 @@ func onlyExchangeID(t *testing.T, tr *Traffic) string {
 func TestRecordKeepsBodiesInIndex(t *testing.T) {
 	tr, dir := openTraffic(t)
 
-	tr.record(newFlow("api.example.com", "POST", "/v1/login",
+	tr.enqueue(newFlow("api.example.com", "POST", "/v1/login",
 		[]byte(`{"user":"admin","password":"P@ssw0rd"}`),
 		[]byte(`{"token":"abc123","note":"内网测试账号"}`)))
 
@@ -117,10 +121,10 @@ func TestFullTextSearchMatchesBodies(t *testing.T) {
 		t.Skip("驱动未启用 FTS5")
 	}
 	const host = "api.example.com"
-	tr.record(newFlow(host, "POST", "/v1/login",
+	tr.enqueue(newFlow(host, "POST", "/v1/login",
 		[]byte(`{"user":"admin","password":"P@ssw0rd"}`),
 		[]byte(`{"token":"abc123","note":"内网测试账号"}`)))
-	tr.record(newFlow(host, "GET", "/v1/health", nil, []byte(`{"status":"ok"}`)))
+	tr.enqueue(newFlow(host, "GET", "/v1/health", nil, []byte(`{"status":"ok"}`)))
 
 	hits := func(term string) int {
 		t.Helper()
@@ -165,7 +169,7 @@ func TestLargeBodySpillsButStaysSearchable(t *testing.T) {
 	if len(big) <= maxInlineBody+blobPreview {
 		t.Fatalf("测试数据不够大：%d 字节", len(big))
 	}
-	tr.record(newFlow(host, "GET", "/backup.sql", nil, big, withRespType("application/sql")))
+	tr.enqueue(newFlow(host, "GET", "/backup.sql", nil, big, withRespType("application/sql")))
 
 	// Stored under a single bucket level, named by hash.
 	var hash string
@@ -247,7 +251,7 @@ func TestBinaryBodyStaysOutOfIndex(t *testing.T) {
 	const marker = "SECRETINIMAGE"
 	png := append([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00},
 		[]byte(strings.Repeat("x", maxInlineBody)+marker)...)
-	tr.record(newFlow(host, "GET", "/logo.png", nil, png, withRespType("image/png")))
+	tr.enqueue(newFlow(host, "GET", "/logo.png", nil, png, withRespType("image/png")))
 
 	rows, err := tr.query(host, "", marker, 0, 10)
 	if err != nil {
@@ -306,7 +310,7 @@ func TestGCCollectsBlobsAndEmptyBuckets(t *testing.T) {
 	tr, dir := openTraffic(t)
 	const host = "dump.example.com"
 	big := []byte(strings.Repeat("A", maxInlineBody+1024))
-	tr.record(newFlow(host, "GET", "/big.bin", nil, big, withRespType("application/sql")))
+	tr.enqueue(newFlow(host, "GET", "/big.bin", nil, big, withRespType("application/sql")))
 
 	var hash string
 	if err := tr.DB().QueryRow(`SELECT resp_blob FROM exchange_bodies`).Scan(&hash); err != nil {
@@ -357,10 +361,10 @@ func TestPageSearchesBodies(t *testing.T) {
 	if !tr.fts {
 		t.Skip("驱动未启用 FTS5")
 	}
-	tr.record(newFlow("api.example.com", "POST", "/v1/login", nil, []byte(`{"error":"invalid credentials"}`)))
-	tr.record(newFlow("api.example.com", "GET", "/v1/health", nil, []byte(`{"status":"ok"}`)))
+	tr.enqueue(newFlow("api.example.com", "POST", "/v1/login", nil, []byte(`{"error":"invalid credentials"}`)))
+	tr.enqueue(newFlow("api.example.com", "GET", "/v1/health", nil, []byte(`{"status":"ok"}`)))
 
-	rows, total, err := tr.Page(PageQuery{Query: "invalid credentials", RespMin: -1, RespMax: -1}, 0, 100)
+	rows, total, err := tr.Page(PageQuery{Query: "invalid credentials"}, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +372,7 @@ func TestPageSearchesBodies(t *testing.T) {
 		t.Fatalf("正文关键词命中 total=%d rows=%d，应为 1/1", total, len(rows))
 	}
 	// Metadata matching still works alongside it.
-	if _, total, err := tr.Page(PageQuery{Query: "health", RespMin: -1, RespMax: -1}, 0, 100); err != nil || total != 1 {
+	if _, total, err := tr.Page(PageQuery{Query: "health"}, 0, 100); err != nil || total != 1 {
 		t.Fatalf("URL 关键词 total=%d err=%v，应为 1", total, err)
 	}
 }
@@ -380,35 +384,35 @@ func TestPageFiltersAndSort(t *testing.T) {
 	tr, _ := openTraffic(t)
 	status := func(code int) flowOpt { return func(f *mproxy.Flow) { f.Response.StatusCode = code } }
 	// Three exchanges with distinct status codes and response sizes.
-	tr.record(newFlow("api.example.com", "GET", "/api/users", nil, make([]byte, 10), status(200)))
-	tr.record(newFlow("api.example.com", "GET", "/api/admin", nil, make([]byte, 100), status(404)))
-	tr.record(newFlow("api.example.com", "GET", "/api/users/1", nil, make([]byte, 50), status(500)))
+	tr.enqueue(newFlow("api.example.com", "GET", "/api/users", nil, make([]byte, 10), status(200)))
+	tr.enqueue(newFlow("api.example.com", "GET", "/api/admin", nil, make([]byte, 100), status(404)))
+	tr.enqueue(newFlow("api.example.com", "GET", "/api/users/1", nil, make([]byte, 50), status(500)))
 
 	// Status class band.
-	if rows, _, err := tr.Page(PageQuery{Status: "4xx", RespMin: -1, RespMax: -1}, 0, 100); err != nil || len(rows) != 1 || rows[0].Status != 404 {
+	if rows, _, err := tr.Page(PageQuery{Status: "4xx"}, 0, 100); err != nil || len(rows) != 1 || rows[0].Status != 404 {
 		t.Fatalf("status=4xx 应命中 1 条 404，得 %d 条 err=%v", len(rows), err)
 	}
 	// Exact status.
-	if rows, _, err := tr.Page(PageQuery{Status: "500", RespMin: -1, RespMax: -1}, 0, 100); err != nil || len(rows) != 1 || rows[0].Status != 500 {
+	if rows, _, err := tr.Page(PageQuery{Status: "500"}, 0, 100); err != nil || len(rows) != 1 || rows[0].Status != 500 {
 		t.Fatalf("status=500 应命中 1 条，得 %d 条 err=%v", len(rows), err)
 	}
 	// Response-size lower bound (>=60 keeps only the 100-byte row).
-	if rows, _, err := tr.Page(PageQuery{RespMin: 60, RespMax: -1}, 0, 100); err != nil || len(rows) != 1 || rows[0].RespLen != 100 {
+	if rows, _, err := tr.Page(PageQuery{RespMin: ptrI(60)}, 0, 100); err != nil || len(rows) != 1 || rows[0].RespLen != 100 {
 		t.Fatalf("resp_min=60 应命中 1 条 100B，得 %d 条 err=%v", len(rows), err)
 	}
 	// Path (url_template) filter narrows to the /api/admin exchange.
-	if rows, _, err := tr.Page(PageQuery{Path: "/api/admin", RespMin: -1, RespMax: -1}, 0, 100); err != nil || len(rows) != 1 || rows[0].Status != 404 {
+	if rows, _, err := tr.Page(PageQuery{Path: "/api/admin"}, 0, 100); err != nil || len(rows) != 1 || rows[0].Status != 404 {
 		t.Fatalf("path=/api/admin 应命中 1 条，得 %d 条 err=%v", len(rows), err)
 	}
 	// Sort by response length, ascending then descending.
-	asc, _, err := tr.Page(PageQuery{RespMin: -1, RespMax: -1, Sort: "resp_len", Order: "asc"}, 0, 100)
+	asc, _, err := tr.Page(PageQuery{Sort: "resp_len", Order: "asc"}, 0, 100)
 	if err != nil || len(asc) != 3 {
 		t.Fatalf("resp_len asc 应返回 3 条，得 %d 条 err=%v", len(asc), err)
 	}
 	if asc[0].RespLen != 10 || asc[1].RespLen != 50 || asc[2].RespLen != 100 {
 		t.Fatalf("resp_len asc 顺序错误：%d,%d,%d", asc[0].RespLen, asc[1].RespLen, asc[2].RespLen)
 	}
-	desc, _, err := tr.Page(PageQuery{RespMin: -1, RespMax: -1, Sort: "resp_len", Order: "desc"}, 0, 100)
+	desc, _, err := tr.Page(PageQuery{Sort: "resp_len", Order: "desc"}, 0, 100)
 	if err != nil || len(desc) != 3 || desc[0].RespLen != 100 || desc[2].RespLen != 10 {
 		t.Fatalf("resp_len desc 顺序错误 err=%v", err)
 	}
@@ -416,9 +420,9 @@ func TestPageFiltersAndSort(t *testing.T) {
 
 func TestQueryHostPortAndURLForms(t *testing.T) {
 	tr, _ := openTraffic(t)
-	tr.record(newFlow("api.example.com:8082", "GET", "/admin", nil, []byte("8082")))
-	tr.record(newFlow("api.example.com:8088", "GET", "/admin", nil, []byte("8088")))
-	tr.record(newFlow("[2001:db8::1]:8443", "GET", "/admin", nil, []byte("8443")))
+	tr.enqueue(newFlow("api.example.com:8082", "GET", "/admin", nil, []byte("8082")))
+	tr.enqueue(newFlow("api.example.com:8088", "GET", "/admin", nil, []byte("8088")))
+	tr.enqueue(newFlow("[2001:db8::1]:8443", "GET", "/admin", nil, []byte("8443")))
 
 	for _, tc := range []struct {
 		name string
@@ -510,7 +514,7 @@ func TestRecordConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := range n {
 		wg.Go(func() {
-			tr.record(newFlow("api.example.com", "GET", fmt.Sprintf("/item/%d", i),
+			tr.enqueue(newFlow("api.example.com", "GET", fmt.Sprintf("/item/%d", i),
 				nil, fmt.Appendf(nil, `{"id":%d}`, i)))
 		})
 	}
@@ -526,3 +530,6 @@ func TestRecordConcurrent(t *testing.T) {
 		t.Fatalf("并发写入后 exchanges=%d bodies=%d，应各为 %d", exchanges, bodies, n)
 	}
 }
+
+// ptrI 是响应长度区间的便捷构造（0 是合法边界，未设置用 nil）。
+func ptrI(v int64) *int64 { return &v }

@@ -42,8 +42,8 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
-import { useStoredSortPreference } from "@/lib/sort-preference";
 import type { TrafficDetail, TrafficExchange, TrafficHost, TrafficResp } from "@/lib/types";
+import { useStoredSortPreference } from "@/lib/sort-preference";
 import { cn } from "@/lib/utils";
 
 function fmtTime(ts: string) {
@@ -54,6 +54,22 @@ function fmtTime(ts: string) {
     minute: "2-digit",
     second: "2-digit",
   });
+}
+
+// The raw-TCP ledger stores unix seconds (SQLite), unlike the exchange list whose
+// ts arrives as an ISO string — hence a separate entry point into fmtTime.
+function fmtUnixTime(ts: number) {
+  if (!ts) return "—";
+  return fmtTime(new Date(ts * 1000).toISOString());
+}
+
+// Describe the SOCKS5 endpoint the agents were given. "Absent" has two different
+// causes and they call for different operator action, so it is spelled out rather
+// than rendered as an empty value.
+function socksHintText(trafficEnabled: boolean | undefined, socksAddr: string | undefined) {
+  if (socksAddr) return `Agent 侧 SOCKS5 入口：${socksAddr}`;
+  if (trafficEnabled) return "SOCKS5 入口不可用（记录代理未启动）";
+  return "流量捕获已关闭，未向 Agent 下发 SOCKS5 入口";
 }
 
 function fmtBytes(n: number) {
@@ -109,7 +125,9 @@ const SORT_STORAGE_KEY = "traffic-sort";
 
 // Status-class buckets for the filter dropdown; the value is sent as `status`,
 // which the backend reads as either an exact code or an "Nxx" class band.
-const STATUS_BUCKETS = ["2xx", "3xx", "4xx", "5xx"];
+// 状态码桶：0 是裸 TCP（未走 HTTP 的转发，status 记为 0），其余是 HTTP 状态码区间。
+const STATUS_BUCKETS = ["0", "2xx", "3xx", "4xx", "5xx"];
+const STATUS_BUCKET_LABELS: Record<string, string> = { "0": "0 · TCP（裸连接）" };
 
 export default function TrafficPage() {
   const [selectedFlows, setSelectedFlows] = React.useState<Set<string>>(() => new Set());
@@ -134,12 +152,42 @@ export default function TrafficPage() {
   const [respMinQ, setRespMinQ] = React.useState("");
   const [respMax, setRespMax] = React.useState("");
   const [respMaxQ, setRespMaxQ] = React.useState("");
+  // Attributed-egress filters: which task, and what actually left through a proxy or a
+  // tunnel. The table already renders "#12 socks5://…" per row, so these narrow it down.
+  // 任务与出口的下拉数据源：任务来自 /api/tasks，出口来自两份流量里实际出现过的值。
+  const [taskOpts, setTaskOpts] = React.useState<{ id: string; label: string }[]>([]);
+  const [egressOpts, setEgressOpts] = React.useState<string[]>([]);
+  React.useEffect(() => {
+    api
+      .tasks()
+      .then((r: { tasks?: { id: string; description?: string; name?: string }[] }) => {
+        setTaskOpts(
+          (r.tasks ?? []).map((t) => ({
+            id: t.id,
+            label: (t.description || t.name || '').slice(0, 30),
+          })),
+        );
+      })
+      .catch(() => undefined);
+    api
+      .trafficEgresses()
+      .then((r: { egresses: string[] }) => setEgressOpts(r.egresses ?? []))
+      .catch(() => undefined);
+  }, []);
+  const [taskFilter, setTaskFilter] = React.useState("");
+  const [egressFilter, setEgressFilter] = React.useState("");
+  // 只看保存了正文的裸 TCP（识别出的数据库协议）：没有这个开关就得一页页翻着找。
+  const [tcpBodyOnly, setTcpBodyOnly] = React.useState(false);
   const [sort, setSort] = useStoredSortPreference<SortField>(SORT_STORAGE_KEY, SORT_FIELDS, "ts", "desc");
 
   const [traffic, setTraffic] = React.useState<TrafficResp | null>(null);
   const [selected, setSelected] = React.useState<TrafficExchange | null>(null);
   const [detail, setDetail] = React.useState<TrafficDetail | null>(null);
   const [detailLoading, setDetailLoading] = React.useState(false);
+
+  // Raw-TCP ledger (the listener's SOCKS5 ingress). Loaded on demand: it is
+  // unrelated to the exchange page the table shows, and most visits never open it.
+  // 账本行的"看头部"展开态：只有识别出的数据库服务才有正文可看。
 
   const [hosts, setHosts] = React.useState<TrafficHost[]>([]); // target picker
   const [selectedHosts, setSelectedHosts] = React.useState<string[]>([]); // checked in picker
@@ -175,8 +223,8 @@ export default function TrafficPage() {
     const t = setTimeout(() => setRespMaxQ(respMax.trim()), 300);
     return () => clearTimeout(t);
   }, [respMax]);
-
-  const hasAdvancedFilter = Boolean(bodyQ || pathQ || respMinQ || respMaxQ) || statusFilter !== "all";
+  const hasAdvancedFilter =
+    Boolean(bodyQ || pathQ || respMinQ || respMaxQ || taskFilter || egressFilter) || statusFilter !== "all";
   const resetAdvancedFilters = () => {
     setBody("");
     setBodyQ("");
@@ -187,13 +235,15 @@ export default function TrafficPage() {
     setRespMinQ("");
     setRespMax("");
     setRespMaxQ("");
+    setTaskFilter("");
+    setEgressFilter("");
   };
 
   // Any filter/size/sort change resets to the first page.
   // biome-ignore lint/correctness/useExhaustiveDependencies: these values intentionally trigger a page reset.
   React.useEffect(() => {
     setPage(0);
-  }, [hostQ, queryQ, method, size, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, sort]);
+  }, [hostQ, queryQ, method, size, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, taskFilter, egressFilter, sort]);
 
   // Load the current page. Auto-refresh only on page 0 (newest) so paging back
   // through history isn't yanked out from under the user.
@@ -207,6 +257,10 @@ export default function TrafficPage() {
           path: pathQ,
           status: statusFilter,
           respMin: respMinQ,
+          taskId: taskFilter && taskFilter !== "unattributed" ? taskFilter : undefined,
+          unattributed: taskFilter === "unattributed",
+          tcpBody: tcpBodyOnly,
+          egress: egressFilter || undefined,
           respMax: respMaxQ,
           sort: sort.field,
           order: sort.direction,
@@ -235,8 +289,12 @@ export default function TrafficPage() {
       alive = false;
       clearInterval(t);
     };
-  }, [page, size, hostQ, method, queryQ, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, sort, reloadTick]);
+  }, [page, size, hostQ, method, queryQ, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, taskFilter, egressFilter, sort, reloadTick]);
 
+  // Raw-TCP ledger: fetched only while its sheet is open. reloadTick is in the
+  // deps so a purge (which deletes exchanges, not this ledger) still refreshes a
+  // panel that may be open behind the confirmation dialog.
+  
   // Delete traffic for the current host filter (substring) or the checked
   // hosts (exact batch), then refetch.
   const allSelected = hosts.length > 0 && hosts.every((h) => selectedHosts.includes(h.host));
@@ -306,6 +364,38 @@ export default function TrafficPage() {
     let alive = true;
     setDetailLoading(true);
     setDetail(null);
+    if (selected.kind === "raw") {
+      // 裸 TCP 没有 HTTP 报文：显示平台记录到的上下行协议头（只有识别出的数据库服务才有），
+      // 用同一套「请求 / 响应」面板呈现，观感和 HTTP 行一致。
+      api
+        .trafficSocks5Body(selected.raw_id ?? 0)
+        .then((d) => {
+          if (!alive) return;
+          setDetail({
+            req: d.up_text || "（这条连接没有记录到上行头部）",
+            resp: d.down_text || "（这条连接没有记录到下行头部）",
+          });
+        })
+        .catch(() => {
+          if (alive) {
+            setDetail({
+              req:
+                "这条 TCP 连接没有可显示的报文。\n\n" +
+                `目标：${selected.url}\n` +
+                `上下行：${fmtBytes(selected.bytes_up ?? 0)} / ${fmtBytes(selected.bytes_down ?? 0)}\n` +
+                `服务识别：${selected.service || "未识别"}\n\n` +
+                "说明：裸 TCP 是透传的，平台只在识别出数据库协议（MySQL/Redis 等）时保存开头若干字节；其余连接只记录元数据（五元组、字节数、出口）。",
+              resp: "",
+            });
+          }
+        })
+        .finally(() => {
+          if (alive) setDetailLoading(false);
+        });
+      return () => {
+        alive = false;
+      };
+    }
     api
       .trafficExchange(selected.id)
       .then((d) => {
@@ -336,6 +426,8 @@ export default function TrafficPage() {
   const pageCount = Math.max(1, Math.ceil(total / size));
   const rangeStart = total === 0 ? 0 : page * size + 1;
   const rangeEnd = page * size + exchanges.length;
+
+  // Raw-TCP ledger page (fixed 50/page, independent of the exchange page size).
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4">
@@ -569,11 +661,35 @@ export default function TrafficPage() {
             <SelectItem value="all">全部状态码</SelectItem>
             {STATUS_BUCKETS.map((s) => (
               <SelectItem key={s} value={s}>
-                {s}
+                {STATUS_BUCKET_LABELS[s] ?? s}
               </SelectItem>
             ))}
           </SelectContent>
         </Select>
+        <Select value={taskFilter || "all"} onValueChange={(v) => setTaskFilter(v === "all" ? "" : v)}>
+          <SelectTrigger size="sm" className="w-40"><SelectValue placeholder="任务" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">全部任务</SelectItem>
+            <SelectItem value="unattributed">未归属（无任务）</SelectItem>
+            {taskOpts.map((t) => (
+              <SelectItem key={t.id} value={t.id}>#{t.id} {t.label}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select value={egressFilter || "all"} onValueChange={(v) => setEgressFilter(v === "all" ? "" : v)}>
+          <SelectTrigger size="sm" className="w-56"><SelectValue placeholder="出口" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">全部出口</SelectItem>
+            <SelectItem value="direct">直连（不经代理/隧道）</SelectItem>
+            {egressOpts.map((v) => (
+              <SelectItem key={v} value={v}>{v}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Checkbox checked={tcpBodyOnly} onCheckedChange={(v) => setTcpBodyOnly(Boolean(v))} />
+          只看有正文的 TCP
+        </label>
         <div className="flex items-center gap-1 text-xs text-muted-foreground">
           <span>响应长度</span>
           <Input
@@ -665,6 +781,7 @@ export default function TrafficPage() {
                     align="right"
                     className="w-24 text-right"
                   />
+                  <TableHead className="w-40">出口 / 任务</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -704,11 +821,16 @@ export default function TrafficPage() {
                     </TableCell>
                     <TableCell className="text-xs text-muted-foreground">{e.content_type}</TableCell>
                     <TableCell className="text-right text-xs tabular-nums">{fmtBytes(e.resp_len)}</TableCell>
+                    <TableCell className="max-w-0 text-muted-foreground text-xs">
+                      <span className="block truncate" title={e.identity ? `身份 ${e.identity}` : undefined}>
+                        {e.egress ? `${e.task_id ? `#${e.task_id} ` : ""}${e.egress}` : "默认出口"}
+                      </span>
+                    </TableCell>
                   </TableRow>
                 ))}
                 {exchanges.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={8} className="py-12 text-center text-sm text-muted-foreground">
+                    <TableCell colSpan={9} className="py-12 text-center text-sm text-muted-foreground">
                       {traffic === null ? "加载中…" : "没有匹配的流量。"}
                     </TableCell>
                   </TableRow>
@@ -753,7 +875,7 @@ export default function TrafficPage() {
                       加载报文…
                     </div>
                   ) : (
-                    <HttpCodeBlock raw={requestWithHost(detail?.req ?? "", selected)} />
+                    <HttpCodeBlock raw={selected?.kind === "raw" ? (detail?.req ?? "") : requestWithHost(detail?.req ?? "", selected)} />
                   )}
                 </TabsContent>
                 <TabsContent value="response" className="min-h-0 overflow-auto">
@@ -825,6 +947,11 @@ export default function TrafficPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* Raw-TCP ledger: connections the listener relayed because they are not
+          HTTP. Content is never captured on that path, so this panel is
+          deliberately metadata-only and separate from the exchange table. */}
     </div>
   );
 }
+

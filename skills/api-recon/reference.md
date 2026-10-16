@@ -159,7 +159,7 @@ grep -rhoaE '([A-Z_][A-Z0-9_]*):\{name:"[^"]*",link:"/[^"]+"\}' js | head
 - `captureResponses` / `recordWs` 仅 depth 模式有效
 - `waitUntil`：大型 SPA 用 `domcontentloaded`，避免 `networkidle2` 挂起
 - `routeTimeout`：单路由 `page.goto` 超时（毫秒）
-- `proxy`：Puppeteer `--proxy-server`；也可设 `HTTP_PROXY` / `HTTPS_PROXY`
+- `proxy`：**一般不用设**。agent 的子进程出网由内核透明重定向进记录监听器（无需任何代理变量）；只有要经隧道访问**内网域名**时才显式指定 SOCKS5（远端解析，如 `socks5://127.0.0.1:8788`）
 
 ### B1. 双 stub 模板（role_permissions + permissions/all）
 

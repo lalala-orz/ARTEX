@@ -3129,6 +3129,30 @@ function CreateTaskSheet({
     }
   }
 
+  // 新建任务时可选的出口：只支持"我已有的隧道/代理"（socks5/http）。平台直拨它，
+  // 不经 global_proxy；探活不过不影响建任务（出口会标记"未生效"并可在隧道管理里重试）。
+  // 出口类型：普通隧道（已有的 socks5/http 代理）或 neo 隧道（平台投放 Neo-ReGeorg 载荷）。
+  const [egressKind, setEgressKind] = React.useState<"proxy" | "regeorg">("proxy");
+  // 控制通道出口（只对 neo 载荷型有意义）：""=跟随 global_proxy（为空则直连），"direct"=强制直连载荷。
+  const [egressUpstream, setEgressUpstream] = React.useState("");
+  const [egressURL, setEgressURL] = React.useState("");
+  const [egressProbe, setEgressProbe] = React.useState("");
+  const [testingEgress, setTestingEgress] = React.useState(false);
+
+  // 只测连通性、不绑定：先确认这条代理真能出去，再决定要不要建这个任务。
+  // 测不通也不阻止建任务（出口会标记「未生效」并在隧道管理里显示原因）。
+  async function testEgress() {
+    setTestingEgress(true);
+    try {
+      const r = await api.tunnelProbe(egressURL.trim(), egressProbe.trim());
+      if (r.ok) toast.success(`能上网：${r.site} → HTTP ${r.status}（${r.latency_ms ?? "-"} ms）`);
+      else toast.error(`不通：${r.reason ?? "未知原因"}`);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTestingEgress(false);
+    }
+  }
   async function createTask() {
     if (!description.trim() || !goal.trim()) {
       toast.error("请填写描述与目标");
@@ -3157,6 +3181,15 @@ function CreateTaskSheet({
         interceptRules: interceptRules
           .map((r) => ({ ...r, pattern: r.pattern.trim() }))
           .filter((r) => r.pattern !== ""),
+        egress: egressURL.trim()
+          ? {
+              kind: egressKind,
+              url: egressURL.trim(),
+              probe: egressProbe.trim(),
+              // 与隧道页保持同一套语义：""=跟随 global_proxy（它为空就直连），"direct"=强制直连载荷。
+              upstream: egressKind === "regeorg" ? egressUpstream : "",
+            }
+          : undefined,
       });
       toast.success("任务已创建");
       setName("");
@@ -3316,6 +3349,73 @@ function CreateTaskSheet({
               <AssetInterceptRulesEditor value={interceptRules} onChange={setInterceptRules} />
               <FieldDescription>
                 仅对本任务生效，不写入全局规则。判定顺序：先按「拦截」规则（含全局）匹配，命中即禁止测试；未命中且本任务配置了「允许」规则时，须命中某条允许规则才放行，否则同样不允许测试；未配置任何允许规则则不启用白名单。
+              </FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="task-egress-url">出口（可选）：一开始就把出口绑好</FieldLabel>
+              <Select value={egressKind} onValueChange={(v) => setEgressKind(v as "proxy" | "regeorg")}>
+                <SelectTrigger size="sm" className="w-full">
+                  <SelectValue placeholder="出口类型" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="proxy">普通隧道：我已有的隧道 / 代理（socks5 / http）</SelectItem>
+                  <SelectItem value="regeorg">neo 隧道：平台投放 Neo-ReGeorg 载荷</SelectItem>
+                </SelectContent>
+              </Select>
+              <Input
+                className="mt-2"
+                id="task-egress-url"
+                value={egressURL}
+                onChange={(e) => setEgressURL(e.target.value)}
+                placeholder={
+                  egressKind === "regeorg"
+                    ? "http://目标/tunnel.php（需先把 neo 载荷投放到目标上）"
+                    : "socks5://user:pass@host:port 或 http://host:port"
+                }
+              />
+              {egressKind === "regeorg" ? (
+                <Select
+                  value={egressUpstream || "follow"}
+                  onValueChange={(v) => setEgressUpstream(v === "follow" ? "" : v)}
+                >
+                  <SelectTrigger size="sm" className="mt-2 w-full">
+                    <SelectValue placeholder="控制通道出口" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="follow">控制通道跟随 global_proxy（默认；全局代理为空则直连）</SelectItem>
+                    <SelectItem value="direct">直连载荷（载荷在私网/内网时必选）</SelectItem>
+                  </SelectContent>
+                </Select>
+              ) : null}
+              <Input
+                className="mt-2"
+                value={egressProbe}
+                onChange={(e) => setEgressProbe(e.target.value)}
+                placeholder={
+                  egressKind === "regeorg"
+                    ? "探活目标 host:port（留空按载荷地址自动推导，如 127.0.0.1:80）"
+                    : "测试网站（留空默认 http://www.baidu.com/）"
+                }
+              />
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={testingEgress || !egressURL.trim()}
+                  onClick={() => void testEgress()}
+                >
+                  {testingEgress ? "测试中…" : "测试连通性"}
+                </Button>
+                <span className="text-muted-foreground text-xs">
+                  先测一下：会**经这条代理访问一次网站**，能取回网页才算通（测不通也不影响建任务）
+                </span>
+              </div>
+              <FieldDescription>
+                {egressKind === "regeorg"
+                  ? "平台投放并驱动这条 neo 载荷作为该任务的出口。控制通道默认跟随 global_proxy（全局代理为空就是直连）；载荷在私网里时请选「直连载荷」。探活不过不会影响建任务："
+                  : "平台直拨这个代理作为该任务的出口（不经 global_proxy）。探活不过不会影响建任务："}
+                出口会标记为「未生效」并在隧道管理里显示原因，可随时重试。
               </FieldDescription>
             </Field>
             <Field>

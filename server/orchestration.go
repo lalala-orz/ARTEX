@@ -39,6 +39,7 @@ func jsonResult(v any) (actool.Result, error) {
 //nolint:unused // used as the hostTools provider in wireAgentAugment
 func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools := append(s.m.HostTools(), s.orchestrationTools()...)
+	tools = append(tools, s.tunnelTools()...)
 	tools = append(tools, s.findingRetestTools()...)
 	tools = append(tools, s.platformTools()...) // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
 	custom, err := s.customTools()
@@ -485,6 +486,13 @@ func (s *Server) seedOrchestrationTools() {
 	for _, t := range s.platformTools() {
 		schema, _ := json.Marshal(t.InputSchema())
 		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, autoAgents)
+	}
+	// 隧道工具默认绑给真正会落地执行的 agent：worker 领意图干活、mainagent 跑主会话。
+	// 运行期还受流量捕获开关约束（hostTools() 只在捕获开启时返回它们）。
+	tunnelAgents, _ := json.Marshal([]string{"worker", "mainagent"})
+	for _, t := range s.tunnelTools() {
+		schema, _ := json.Marshal(t.InputSchema())
+		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, tunnelAgents)
 	}
 	s.refreshBuiltinToolSchemas()
 	s.seedAutoDefaultBindings()

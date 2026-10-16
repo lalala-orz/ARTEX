@@ -76,6 +76,7 @@ import type {
   Severity,
   SkillCall,
   SkillItem,
+  Socks5Resp,
   SSProject,
   SSTask,
   Stats,
@@ -260,6 +261,9 @@ export const api = {
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
     interceptRules?: AssetInterceptRuleInput[];
+    // 建任务时可选绑定的出口（只支持"我已有的隧道/代理"：socks5/http，直拨不经 global_proxy）。
+    // kind: "proxy"=已有的隧道/代理（默认），"regeorg"=平台投放 neo 载荷。
+    egress?: { kind?: string; url: string; probe?: string; upstream?: string };
   }) =>
     post<Task>("/tasks", {
       name: input.name ?? "",
@@ -273,6 +277,14 @@ export const api = {
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
+      egress: input.egress
+        ? {
+            kind: input.egress.kind ?? "proxy",
+            url: input.egress.url,
+            probe: input.egress.probe ?? "",
+            upstream: input.egress.upstream ?? "",
+          }
+        : null,
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
@@ -785,6 +797,15 @@ export const api = {
       status?: string;
       respMin?: string;
       respMax?: string;
+      // Attributed egress: which task, and what actually left (a proxy URL, a tunnel
+      // label, or empty for a direct dial). Matches the traffic page's row display.
+      taskId?: string;
+      // 只看无任务归属的流量（task 0）：不能靠 taskId="0"，后端会当成没填。
+      unattributed?: boolean;
+      // 只看保存了正文的裸 TCP（识别出的数据库协议）。
+      tcpBody?: boolean;
+      identity?: string;
+      egress?: string;
       sort?: string;
       order?: string;
     } = {},
@@ -799,11 +820,88 @@ export const api = {
         (opts.status && opts.status !== "all" ? `&status=${encodeURIComponent(opts.status)}` : "") +
         (opts.respMin ? `&resp_min=${encodeURIComponent(opts.respMin)}` : "") +
         (opts.respMax ? `&resp_max=${encodeURIComponent(opts.respMax)}` : "") +
+        (opts.taskId ? `&task_id=${encodeURIComponent(opts.taskId)}` : "") +
+        (opts.unattributed ? "&unattributed=1" : "") +
+        (opts.tcpBody ? "&tcp_body=1" : "") +
+        (opts.identity ? `&identity=${encodeURIComponent(opts.identity)}` : "") +
+        (opts.egress ? `&egress=${encodeURIComponent(opts.egress)}` : "") +
         (opts.sort ? `&sort=${encodeURIComponent(opts.sort)}` : "") +
         (opts.order ? `&order=${encodeURIComponent(opts.order)}` : ""),
     ),
   trafficExchange: (id: string) => get<TrafficDetail>(`/traffic/exchange?id=${encodeURIComponent(id)}`),
   trafficHosts: () => get<{ hosts: TrafficHost[] }>(`/traffic/hosts`),
+  // Raw-TCP connection ledger from the listener's SOCKS5 ingress (metadata only:
+  // target, byte counts, whether the egress proxy was used).
+  // 出口下拉的数据源：两份流量里实际出现过的出口值（空=直连，由前端渲染成「直连」）。
+  // 裸 TCP 连接记录的上下行协议头（只有识别出的数据库服务才有）—— 流量页拿它当
+  // 「请求 / 响应」显示，跟 HTTP 行的观感统一。
+  trafficSocks5Body: (id: number) =>
+    get<{ id: number; service: string; up_head: string; down_head: string; up_text: string; down_text: string }>(
+      `/traffic/socks5/body?id=${id}`,
+    ),  trafficEgresses: () => get<{ egresses: string[] }>(`/traffic/egresses`),  trafficSocks5: (page = 0, size = 50, host = "") =>
+    get<Socks5Resp>(`/traffic/socks5?page=${page}&size=${size}${host ? `&host=${encodeURIComponent(host)}` : ""}`),
+  // ---- 平台文件库（data/files）：任意文件的上传 / 下载 / 删除 ----
+  // 载荷只是这份目录上的一个视图（payload=true），不再是唯一入口。
+  files: () =>
+    get<{
+      dir: string;
+      total: number;
+      payload_count: number;
+      files: {
+        name: string;
+        size: number;
+        mod_time: string;
+        sha256?: string;
+        payload: boolean;
+        override?: boolean;
+        description?: string;
+        kind?: string;
+        backend?: string;
+        deploy?: string;
+        target?: string;
+        requires?: string;
+        tunnel_url?: string;
+        notes?: string[];
+        caveats?: string[];
+      }[];
+    }>(`/files`),
+  fileUpload: async (files: File[], description = "") => {
+    const fd = new FormData();
+    for (const f of files) fd.append("file", f);
+    // 说明随文件一起交：agent 只看文件名不知道这是什么、怎么用。
+    if (description) fd.append("description", description);
+    const token = getToken();
+    const r = await fetch(`/api/files/upload`, {
+      method: "POST",
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: fd,
+    });
+    if (!r.ok) throw new Error(`上传失败: ${r.status} ${await r.text()}`);
+    return r.json() as Promise<{ saved: string[]; count: number; dir: string }>;
+  },
+  fileDelete: (name: string) => del<{ deleted: string }>(`/files?name=${encodeURIComponent(name)}`),
+  fileMeta: async (name: string, description: string) => {
+    const token = getToken();
+    const r = await fetch(`/api/files/meta`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify({ name, description }),
+    });
+    if (!r.ok) throw new Error(`保存说明失败: ${r.status} ${await r.text()}`);
+    return r.json() as Promise<{ name: string; description: string }>;
+  },
+  // 测连通性：重探已绑隧道（不改绑定）／只测不绑（建表单里先验一下）。
+  tunnelCheck: (taskId: string | number) =>
+    post<{ healthy: boolean; reason: string; tunnels: number }>(`/tasks/${taskId}/tunnel/check`, {}),
+  // 替换某任务的隧道（旧先关、新建；失败时后端会明确说明已退回 global_proxy）。
+  replaceTunnel: (
+    taskId: string | number,
+    input: { kind: string; url: string; probe?: string; upstream?: string },
+  ) => post<{ replaced: number; egress: string; server_url: string }>(`/tasks/${taskId}/tunnel/replace`, input),  tunnelProbe: (url: string, probe: string) =>
+    post<{ ok: boolean; reason?: string; site?: string; status?: number; bytes?: number; latency_ms?: number }>(
+      "/tunnels/probe",
+      { url, test_url: probe }, 
+    ),  fileRevert: (name: string) => post<{ reverted: string }>(`/files/revert`, { name }),
   trafficDeleteHost: (host: string) => del<{ deleted: number }>(`/traffic?host=${encodeURIComponent(host)}`),
   trafficDeleteHosts: (hosts: string[]) => del<{ deleted: number }>(`/traffic/hosts`, { hosts }),
   // Purges every exchange and compacts the index; `reclaimed` is the bytes of
@@ -825,8 +923,7 @@ export const api = {
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
   notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
-  notifyChannels: () =>
-    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
     kind: string;

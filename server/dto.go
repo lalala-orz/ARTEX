@@ -155,6 +155,9 @@ type TrafficExchangeDTO struct {
 	Status      int    `json:"status"`
 	ContentType string `json:"content_type"`
 	RespLen     int    `json:"resp_len"`
+	TaskID      int64  `json:"task_id"`
+	Identity    string `json:"identity"`
+	Egress      string `json:"egress"`
 }
 
 func trafficDTOs(ex []traffic.ExchangeMeta) []TrafficExchangeDTO {
@@ -169,6 +172,9 @@ func trafficDTOs(ex []traffic.ExchangeMeta) []TrafficExchangeDTO {
 			Status:      e.Status,
 			ContentType: e.ContentType,
 			RespLen:     e.RespLen,
+			TaskID:      e.TaskID,
+			Identity:    e.Identity,
+			Egress:      e.Egress,
 		})
 	}
 	return out
@@ -657,6 +663,46 @@ func idStrings(in []int64) []string {
 	out := make([]string, 0, len(in))
 	for _, v := range in {
 		out = append(out, i64s(v))
+	}
+	return out
+}
+
+// UnifiedTrafficDTO 是流量页一行的统一形态：kind=http 是被 MITM 的交换，kind=raw
+// 是裸 TCP 转发（后端字段只有 raw 才有意义）。两者同表展示、同套筛选。
+type UnifiedTrafficDTO struct {
+	TrafficExchangeDTO
+	Kind        string `json:"kind"`
+	RawID       int64  `json:"raw_id,omitempty"`
+	BytesUp     int64  `json:"bytes_up,omitempty"`
+	BytesDown   int64  `json:"bytes_down,omitempty"`
+	Service     string `json:"service,omitempty"`
+	ViaUpstream bool   `json:"via_upstream"`
+}
+
+func unifiedDTOs(rows []traffic.UnifiedRow) []UnifiedTrafficDTO {
+	out := make([]UnifiedTrafficDTO, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, UnifiedTrafficDTO{
+			TrafficExchangeDTO: TrafficExchangeDTO{
+				ID:          r.ID,
+				TS:          rfc3339(time.Unix(r.TS, 0)),
+				Host:        r.Host,
+				Method:      r.Method,
+				URL:         r.URL,
+				Status:      r.Status,
+				ContentType: r.ContentType,
+				RespLen:     r.RespLen,
+				TaskID:      r.TaskID,
+				Identity:    r.Identity,
+				Egress:      r.Egress,
+			},
+			Kind:        r.Kind,
+			RawID:       r.RawID,
+			BytesUp:     r.BytesUp,
+			BytesDown:   r.BytesDown,
+			Service:     r.Service,
+			ViaUpstream: r.ViaUpstream,
+		})
 	}
 	return out
 }

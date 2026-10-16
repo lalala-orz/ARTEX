@@ -126,6 +126,12 @@ func run() int {
 		}
 	}()
 
+	// 起服务后无条件对账一次「agent 出网收敛」（设置开着但内核里没规则 = fail-open）。
+	// 容器重建会把 netns 里的 REDIRECT 一起带走，而原来的两个调用点一个在"重载 PG 任务"
+	// 分支、一个只在设置里切换捕获时触发 ⇒ 重启后很容易出现"设置开、规则无"，实测就撞上了。
+	// 管理器内部自己判断：设置关闭 ⇒「关闭」；监听器未起 ⇒「未生效：监听器未运行」；
+	// 而且它是后台执行的，不会拖住启动。
+	mgr.ApplyEgressLockdownOnBoot()
 	// Two ways out: a signal (normal stop → exit 0, the start script stops looping)
 	// or a staged update / rollback (→ exit 75, the script relaunches us and the
 	// bootstrap above installs the new build).

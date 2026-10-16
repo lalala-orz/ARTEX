@@ -175,7 +175,9 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 			s.engine.StopTask(id)
 			s.taskAgentMu.Lock()
 			delete(s.taskAgents, id)
+			s.m.ReleaseAgentUID(id)
 			s.taskAgentMu.Unlock()
+			s.m.ForgetTaskRuntime(id) // its tunnels and listener credentials die with it
 			deleted = true
 			writeCommittedTaskDelete(w, result, err)
 			return
@@ -190,6 +192,7 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 	s.taskAgentMu.Lock()
 	delete(s.taskAgents, id)
 	s.taskAgentMu.Unlock()
+	s.m.ForgetTaskRuntime(id) // its tunnels and listener credentials die with it
 	deleted = true
 	writeJSON(w, 200, result)
 }

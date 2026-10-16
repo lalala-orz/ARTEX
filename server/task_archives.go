@@ -233,7 +233,9 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 	s.engine.StopTask(taskID)
 	s.taskAgentMu.Lock()
 	delete(s.taskAgents, taskID)
+	s.m.ReleaseAgentUID(taskID)
 	s.taskAgentMu.Unlock()
+	s.m.ForgetTaskRuntime(taskID) // archived: its tunnels and listener credentials go too
 	s.m.forgetTask(taskID, job.TaskID)
 	return nil
 }

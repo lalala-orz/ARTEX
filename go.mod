@@ -1,6 +1,18 @@
 module github.com/Autumn-27/artex
 
-go 1.26.3
+go 1.26.5
+
+// Local patch: v1.9.2 closes a nil conn when a SOCKS5 upstream dial fails,
+// panicking inside dialFn — which skips the 502 attacker.attack would have
+// written and leaves net/http to render the silence as a bogus empty 200, with
+// no addon hook (RequestError) ever seeing the failure. See
+// third_party/go-mitmproxy/internal/helper/proxy.go. Upgrading go-mitmproxy
+// means re-applying that one-line guard.
+//
+// The fork also carries the SOCKS5 ingress that shares the recorder's listening
+// port (third_party/go-mitmproxy/proxy/socks5.go): its proxy/attacker internals
+// are unexported, so the ingress cannot live outside this module.
+replace github.com/lqqyt2423/go-mitmproxy => ./third_party/go-mitmproxy
 
 require (
 	github.com/Autumn-27/norma v0.4.3

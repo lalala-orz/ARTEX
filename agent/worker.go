@@ -57,12 +57,20 @@ type Worker struct {
 	model           string
 	workDir         string
 	proxyAddr       string
-	proxyCACert     string            // recording proxy's CA cert path (for WebFetch HTTPS verify)
-	webSearch       WebSearchOpts     // web_search tool backend selection (off by default)
-	tx              *transcript.Store // raw LLM conversation persistence (nil = off)
-	window          int               // context window in tokens (for compaction)
-	windowFn        func() int        // optional dynamic task-chain minimum
-	maxTurns        int               // max agent turns per run (0 = unlimited)
+	socksAddr       string        // same listener's SOCKS5 URL for raw-TCP egress ("" = none)
+	proxyCACert     string        // recording proxy's CA cert path (for WebFetch HTTPS verify)
+	webSearch       WebSearchOpts // web_search tool backend selection (off by default)
+	// shellEnvFn supplies extra environment for the agent's Bash subprocesses, read
+	// per run so toggling the egress lockdown takes effect without a rebuild (S3).
+	shellEnvFn func() []string
+	// lockdownFn reports whether the kernel confinement is on, read per run. nil is
+	// treated as OFF so the proxy variables are injected: if wiring is forgotten the
+	// failure mode is "recorded through the listener", never "silent direct".
+	lockdownFn func() bool
+	tx         *transcript.Store // raw LLM conversation persistence (nil = off)
+	window     int               // context window in tokens (for compaction)
+	windowFn   func() int        // optional dynamic task-chain minimum
+	maxTurns   int               // max agent turns per run (0 = unlimited)
 	// runTimeout is the wall-clock budget for the main exploration of one intent
 	// (0 = unlimited). When it fires, the run is cut and a settlement round is
 	// forced so already-identified facts get written back instead of being lost.
@@ -183,44 +191,103 @@ func (w *Worker) compactionWindow() int {
 	return w.window
 }
 
-// SetProxy configures the recording proxy address that workers route target
-// traffic through, plus the CA cert path WebFetch trusts to verify HTTPS through
-// that MITM proxy. Empty addr disables the hint.
-func (w *Worker) SetProxy(addr, caCert string) { w.proxyAddr, w.proxyCACert = addr, caCert }
+// SetProxy configures where the worker's target traffic goes: the recording
+// listener's address, the CA cert path that HTTPS interception must be trusted
+// with, and the listener's SOCKS5 endpoint — now only needed for names that
+// require remote resolution (internal names reachable through a tunnel).
+//
+// Ordinary egress is deliberately absent: the kernel redirects every TCP
+// connection the agent opens into the listener, so nothing about proxies is
+// injected into the shell environment beyond CA trust.
+func (w *Worker) SetProxy(addr, caCert, socksAddr string) {
+	w.proxyAddr, w.proxyCACert, w.socksAddr = addr, caCert, socksAddr
+}
 
 // SetWebSearch selects the web_search backend for this worker (off by default).
 func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
 
-// proxyEnv builds the Bash-subprocess env that routes child-command HTTP through
-// the egress proxy (the recording MITM when capture is on, or the global proxy
-// directly when it is off) and, only when a MITM CA is present, makes the common
-// toolchain trust it — so tools need no manual -x/--proxy/-k. Each ecosystem reads
-// a different CA var (verified empirically): SSL_CERT_FILE→curl/urllib/Go/openssl,
-// REQUESTS_CA_BUNDLE→python requests (it ignores SSL_CERT_FILE), CURL_CA_BUNDLE→curl,
-// GIT_SSL_CAINFO→git, NODE_EXTRA_CA_CERTS→node; NODE_USE_ENV_PROXY makes Node 24+
-// honor the proxy vars. ALL_PROXY is set too so a socks5 egress proxy (which curl
-// only reads from ALL_PROXY, not HTTP(S)_PROXY) works in the capture-off path.
-// Empty proxyAddr → nil (direct, unchanged env).
-func proxyEnv(proxyAddr, caCert string) []string {
-	if proxyAddr == "" {
+// shellEnv returns the per-run extra environment for the agent's shell (nil when
+// nothing is configured).
+func (w *Worker) shellEnv() []string {
+	if w.shellEnvFn == nil {
 		return nil
 	}
-	env := []string{
-		"HTTP_PROXY=" + proxyAddr, "HTTPS_PROXY=" + proxyAddr,
-		"http_proxy=" + proxyAddr, "https_proxy=" + proxyAddr,
-		"ALL_PROXY=" + proxyAddr, "all_proxy=" + proxyAddr, // socks5 egress: curl reads only this
-		"NODE_USE_ENV_PROXY=1", // Node 24+: honor HTTP(S)_PROXY in built-in fetch/http
+	return w.shellEnvFn()
+}
+
+// SetShellEnv supplies extra environment for this agent's Bash subprocesses (S3:
+// the uid the shell wrapper drops to; with transparent interception this carries
+// no proxy settings at all).
+func (w *Worker) SetShellEnv(fn func() []string) { w.shellEnvFn = fn }
+
+// lockdown reports whether the kernel confines this agent's egress. Defaults to
+// false when unwired, so a missing hook injects the proxy variables (recorded)
+// rather than letting commands leave unrecorded.
+func (w *Worker) lockdown() bool {
+	if w.lockdownFn == nil {
+		return false
 	}
-	if caCert != "" {
-		env = append(env,
-			"SSL_CERT_FILE="+caCert,
-			"CURL_CA_BUNDLE="+caCert,
-			"REQUESTS_CA_BUNDLE="+caCert,
-			"GIT_SSL_CAINFO="+caCert,
-			"NODE_EXTRA_CA_CERTS="+caCert,
-		)
+	return w.lockdownFn()
+}
+
+// SetEgressLockdown wires the live confinement state for this agent (S3).
+func (w *Worker) SetEgressLockdown(fn func() bool) { w.lockdownFn = fn }
+
+// caEnv is the CA-trust half of the Bash environment, shared by both modes.
+func caEnv(caCert string) []string {
+	if caCert == "" {
+		return nil
 	}
-	return env
+	return []string{
+		"SSL_CERT_FILE=" + caCert,
+		"CURL_CA_BUNDLE=" + caCert,
+		"REQUESTS_CA_BUNDLE=" + caCert,
+		"GIT_SSL_CAINFO=" + caCert,
+		"NODE_EXTRA_CA_CERTS=" + caCert,
+	}
+}
+
+// proxyEnv is the Bash environment used while the kernel confinement is ON: CA
+// trust only. Egress is not advertised, because the kernel redirects every TCP
+// connection the agent opens into the listener — a client that knows nothing about
+// proxies is still recorded, and one that ignores an environment variable cannot
+// slip out. Each ecosystem reads its own CA variable (verified empirically):
+// SSL_CERT_FILE→curl/urllib/Go/openssl, REQUESTS_CA_BUNDLE→python requests (it
+// ignores SSL_CERT_FILE), CURL_CA_BUNDLE→curl, GIT_SSL_CAINFO→git,
+// NODE_EXTRA_CA_CERTS→node.
+func proxyEnv(proxyAddr, caCert, socksAddr string) []string { return caEnv(caCert) }
+
+// egressEnv is the Bash environment used while the confinement is OFF. Nothing
+// forces traffic through the listener then, so the proxy variables must come back
+// or every agent command would leave **unrecorded** — a silent regression the
+// toggle must never cause. With the HTTP proxy ingress gone the address is the
+// listener's SOCKS5 endpoint (socks5h:// = remote resolution, which is what curl,
+// wget and requests+PySocks read); anything that speaks only the HTTP proxy
+// protocol now fails loudly instead of leaking quietly.
+func egressEnv(proxyAddr, caCert, socksAddr string) []string {
+	env := caEnv(caCert)
+	target := socksAddr
+	if target == "" {
+		target = proxyAddr
+	}
+	if target == "" {
+		return env
+	}
+	return append(env,
+		"HTTP_PROXY="+target, "HTTPS_PROXY="+target,
+		"http_proxy="+target, "https_proxy="+target,
+		"ALL_PROXY="+target, "all_proxy="+target,
+		"NO_PROXY=127.0.0.1,localhost", "no_proxy=127.0.0.1,localhost",
+	)
+}
+
+// bashEnv picks the environment for this run. lockdown reads the live setting, so
+// toggling it takes effect on the next command without rebuilding the agent.
+func bashEnv(proxyAddr, caCert, socksAddr string, lockdown bool) []string {
+	if lockdown {
+		return proxyEnv(proxyAddr, caCert, socksAddr)
+	}
+	return egressEnv(proxyAddr, caCert, socksAddr)
 }
 
 // workerDefaultTmpl is the built-in EDITABLE body (段 [A]) of the worker system
@@ -247,11 +314,55 @@ const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 // Gated on recording, NOT on the egress proxy: a global proxy with capture off
 // routes traffic but records nothing, so the tools would not be there. Not stored,
 // not editable.
-func workerTrafficBlock(recording bool) string {
+//
+// socksAddr is the recording listener's SOCKS5 endpoint ("" when it has none).
+// Raw-TCP egress is described here rather than left to the editable body because
+// it is a property of the listener the code just wired, not of the persona.
+func workerTrafficBlock(recording bool, socksAddr string) string {
 	if !recording {
 		return ""
 	}
-	return "\n\n**流量工具**：\n- traffic_search / traffic_get / traffic_blob：回看响应、找已访问过的资源，**先查流量、不要重复 curl 同一 URL**。traffic_search **必须指定 host**、默认只回 3 条极轻量索引(id/method/url/status/resp_len，无响应内容)，需要更多显式调大 limit；可用 body_contains 在请求/响应正文里做全文搜索(至少 3 字符，支持子串和中文，如找密码/密钥/报错/内网地址)；要看某条原文用 traffic_get(id)，其中超大正文显示为 @blob sha256:<hash>，用 traffic_blob(hash) 分段取全文。"
+	block := "\n\n**流量工具**：\n- traffic_search / traffic_get / traffic_blob：回看响应、找已访问过的资源，**先查流量、不要重复 curl 同一 URL**。traffic_search **必须指定 host**、默认只回 3 条极轻量索引(id/method/url/status/resp_len，无响应内容)，需要更多显式调大 limit；可用 body_contains 在请求/响应正文里做全文搜索(至少 3 字符，支持子串和中文，如找密码/密钥/报错/内网地址)；要看某条原文用 traffic_get(id)，其中超大正文显示为 @blob sha256:<hash>，用 traffic_blob(hash) 分段取全文。"
+	// 出网已经是内核级透明兜底：agent 的每条 TCP 都被重定向进记录监听器，平台上也没有
+	// 注入任何代理变量。所以这里要说的不是"该用哪种客户端"，而是"记录到什么程度"——
+	// 免得 agent 引用并不存在的证据，或者把步数花在配代理上。
+	block += "\n\n**出网是透明的，不用配代理**：你的每条 TCP 连接都会被内核自动送进记录监听器——`curl`、`wget`、Python `requests`/裸 `socket`/`http.client`、`nmap`、`mysql`、`redis-cli` 都一样，**不需要设置任何代理变量（平台也没有注入），想直连也直连不出去**。不要为了「配置/绕过代理」花步数。"
+	if socksAddr == "" {
+		return block
+	}
+	// 记录深度必须说清：HTTP/HTTPS 有正文，其余协议只有元数据 + 前 8KB。agent 若以为
+	// 数据库正文全被保存，事后会引用并不存在的证据。
+	host, port, ok := socksHostPort(socksAddr)
+	snippet := ""
+	if ok {
+		snippet = "\n  ```python\n" +
+			"  import socks  # pip install PySocks\n" +
+			"  s = socks.socksocket()\n" +
+			"  s.set_proxy(socks.SOCKS5, \"" + host + "\", " + port + ", rdns=True)  # rdns=远端解析\n" +
+			"  s.connect((\"db.internal\", 3306))   # 目标按实际填写\n" +
+			"  ```\n"
+	}
+	block += "\n\n**记录到什么程度（据此决定要不要自己留证据）**：\n" +
+		"- **HTTP / HTTPS**：完整交换（请求行 + 头 + 正文）。HTTPS 由平台 CA 解密，且已注入 CA 信任变量，正常校验即可（不要 `-k` / `verify=False`）。\n" +
+		"- **其它 TCP**（MySQL / Redis / SSH / 自定义协议）：**连接元数据 + 双向各前 8KB 原始字节**——MySQL 的握手与前几条 SQL、Redis 的前几条命令都在里面；更大的内容不落库。要靠数据库大结果集当证据时，**自己把结果写到工作目录**。\n" +
+		"- **只有经隧道才解析得了的内网域名**：透明拦截发生在名字解析之后，本地解析不了的名字走不通；这类名字显式用监听器的 SOCKS5 入口（远端解析）：" + snippet +
+		"- 从哪出去（直连 / 全局代理 / 本任务的隧道）由平台决定，你不需要关心。"
+	return block
+}
+
+// socksHostPort splits the listener's SOCKS5 URL into host and port for the
+// prompt snippet. ok=false on anything that is not host:port, so a malformed
+// value omits the snippet rather than shipping a broken one to the agent.
+func socksHostPort(addr string) (host, port string, ok bool) {
+	rest := addr
+	if i := strings.Index(rest, "://"); i >= 0 {
+		rest = rest[i+3:]
+	}
+	i := strings.LastIndexByte(rest, ':')
+	if i <= 0 || i == len(rest)-1 {
+		return "", "", false
+	}
+	return strings.Trim(rest[:i], "[]"), rest[i+1:], true
 }
 
 // artifactSpec is 段 [C]: the code-owned, non-editable tail appended to every
@@ -285,12 +396,31 @@ func ensureRunDir(base string, taskID, intentID int64) string {
 // cmdOutDir is the SDK large-tool-output spill dir under an agent's run dir.
 func cmdOutDir(dir string) string { return filepath.Join(dir, "cmd-output") }
 
-func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
-	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
+func workerSystem(proxyAddr, caCert, socksAddr, dataDir, runDir string) string {
+	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, SocksAddr: socksAddr, DataDir: dataDir, Now: nowStr()})
 	// caCert is present only when the recording MITM is on, which is exactly when
-	// the traffic_* tools are registered — so it gates the traffic-tool note.
+	// the traffic_* and tunnel_* tools are registered — so it gates both notes.
 	// Optional finding guidance is added for every role after tool resolution.
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
+	recording := caCert != ""
+	return body + workerTrafficBlock(recording, socksAddr) +
+		workerTunnelBlock(recording, dataDir) + workerArtifactSpec(runDir)
+}
+
+// workerTunnelBlock tells the worker that the platform ships tunnel payloads and
+// where they are. An agent that has just taken a host needs both halves: that the
+// capability exists, and which file matches the target's runtime — so the library
+// path is code-owned (it follows the data dir), not left to the persona.
+func workerTunnelBlock(recording bool, dataDir string) string {
+	if !recording || dataDir == "" {
+		return ""
+	}
+	lib := filepath.Join(dataDir, "files")
+	return "\n\n**内网隧道（用于访问内网站点与内网服务）**：\n" +
+		"- 载荷文件库在 `" + lib + "`，每个文件的说明见同目录 `manifest.json`（也可调 tunnel_payloads 一次拿到清单）。清单里写明：目标运行环境、**投放方式**（upload-file＝上传到 Web 可访问路径 / run-process＝在目标上执行 / exploit-request＝原样发送该 HTTP 请求 / compile-inject＝编译后注入）、环境要求、支持的传输模式、投放后应交给 tunnel_up 的 URL、以及已知坑。**先看清单再挑文件，不要凭扩展名猜。**\n" +
+		"- 流程：读清单挑出匹配目标运行时的文件 → 按它的 deploy 方式投放到目标 → 用可访问 URL 调 `tunnel_up(url=...)`（它会先经隧道做端到端探活，通过后才把**本任务**的出网流量绑到这条隧道，其他任务不受影响）→ 访问内网目标 → 用完 `tunnel_down` 释放。\n" +
+		"- 隧道只用来**访问内网站点与内网服务**，不要拿它做端口扫描或并发压测：PHP 载荷每个连接会占住一个 PHP-FPM worker，压满会把目标整站阻塞（连正常请求都进不来），既破坏目标也暴露自己。用完就关。\n" +
+		"- 隧道被判为不可用时（tunnel_list 里 healthy=false），该任务的新连接会被**拒绝**而不是退回直连 —— 这是故意的，避免用本机真实地址去打内网目标；此时应重建隧道。\n" +
+		"- 载荷各自的局限要看清单：**PHP 目标优先用 tunnel.php**；JSP/ASPX 用同名的 tunnel.jsp / tunnel.aspx，Go/Node 目标用 tunnel.go / tunnel.js。清单里 backend 字段标明每份载荷配哪个后端。"
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -393,7 +523,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.socksAddr, w.workDir, runDir)
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
@@ -437,7 +567,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		// WebFetch 走记录代理，其 HTTP 与 curl 一样被留痕；载入代理 CA 让经 MITM
 		// 重签的 HTTPS 证书能【正常校验通过】（而非关掉校验）。proxy 空则直连。
 		EnableWebFetch: true,
-		WebFetchProxy:  w.proxyAddr,
+		// WebFetch 代表 agent 取目标页面，改走监听器的 SOCKS5（Go 的 socks5 是远端解析）。
+		WebFetchProxy:  strings.Replace(w.socksAddr, "socks5h://", "socks5://", 1),
 		WebFetchCACert: w.proxyCACert,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
 		// WebSearchProxy 是独立的出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
@@ -450,7 +581,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		DeepSeekSearchModel:   w.webSearch.DeepSeekModel,
 		WebSearchProxy:        w.webSearch.Proxy,
 		// Bash 子命令的 HTTP 默认走记录代理 + 信任其 CA（工具无需 -x/-k）。
-		BashEnv:    proxyEnv(w.proxyAddr, w.proxyCACert),
+		BashEnv:    append(bashEnv(w.proxyAddr, w.proxyCACert, w.socksAddr, w.lockdown()), w.shellEnv()...),
 		WorkingDir: runDir,
 		MaxTurns:   w.maxTurns, // 0 = unlimited (configurable in agent management)
 		// 墙钟预算,轮边界判,不打断半路;0 = 不限。有任务级 deadline 时夹逼到 min(自身预算,

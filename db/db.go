@@ -190,6 +190,7 @@ var builtinAgents = []builtinAgent{
 	}, false, nil},
 	{"worker", "执行", "worker", "领取一条意图执行，把发现的事实/漏洞写回知识图谱后停止。", []promptVar{
 		{"ProxyAddr", "记录代理地址(驱动 if 双文案)", "127.0.0.1:8080", "runtime"},
+		{"SocksAddr", "记录代理的 SOCKS5 地址(裸 TCP 出网用；捕获关闭时为空)", "socks5h://127.0.0.1:8788", "runtime"},
 		{"WorkerName", "worker 自我标识(可选)", "worker-1", "runtime"},
 	}, false, nil},
 	// Auto:内置「平台操作」agent。不参与渗透编排循环,经对话页驱动,用工具操作平台。

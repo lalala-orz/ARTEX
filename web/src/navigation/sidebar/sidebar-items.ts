@@ -5,6 +5,7 @@ import {
   Bot,
   Brain,
   Bug,
+  Cable,
   ClipboardList,
   FolderOpen,
   FolderSync,
@@ -74,6 +75,9 @@ export const sidebarItems: NavGroup[] = [
       { id: "commands", title: "工具执行", url: "/function/commands", icon: Terminal },
       { id: "llm-records", title: "LLM 录制", url: "/function/llm-records", icon: Radio },
       { id: "assets", title: "资产", url: "/function/assets", icon: Network },
+      { id: "tunnels", title: "内网隧道", url: "/function/tunnels", icon: Cable },
+  // 文件管理与隧道分家：载荷只是文件库里的一个视图，用户还要传自己的东西。
+  { id: "files", title: "文件管理", url: "/function/files", icon: FolderOpen },
       { id: "sync", title: "资产同步", url: "/function/sync", icon: FolderSync },
       { id: "workspace", title: "工作空间", url: "/function/workspace", icon: FolderOpen },
     ],

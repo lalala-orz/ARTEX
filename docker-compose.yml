@@ -16,6 +16,9 @@ services:
 
   artex:
     image: autumn27/artex:${ARTEX_TAG:-latest}
+    # S3：容器内按 uid 收敛 agent 出网（iptables 需要 NET_ADMIN）。
+    cap_add:
+      - NET_ADMIN
     depends_on:
       postgres:
         condition: service_healthy

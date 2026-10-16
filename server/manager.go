@@ -1,11 +1,14 @@
 package server
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,6 +22,7 @@ import (
 	"github.com/Autumn-27/artex/enrich"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/payloads"
 	"github.com/Autumn-27/artex/traffic"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -232,6 +236,11 @@ type Manager struct {
 	tasks       map[string]*Task
 	active      string
 	trafficOn   bool // 流量捕获开关（默认关；settings.traffic_capture）
+	// agentUIDs 给每个任务分配专属 uid（出网收敛用；uid 同时就是身份）。
+	agentUIDs *agentUIDs
+	// egressRules 是内核规则的实况（已生效 / 未生效：…）：设置页照它显示，绝不谎报。
+	egressMu    sync.Mutex
+	egressRules string
 	llmRecOn    bool // LLM 录制开关（默认关；settings.llm_record）
 	// 联网搜索开关与来源（默认关；settings.web_search_*）。brave-free 需要 braveKey；tavily 需要 tavilyKey。
 	// webSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关。
@@ -245,6 +254,28 @@ type Manager struct {
 	// capture is on it becomes the MITM's upstream; when capture is off it is
 	// injected into agent bash env / WebFetch directly. See ProxyAddr.
 	globalProxy string
+	// taskCreds holds each task's credentials on the recording listener: the identity
+	// its agents authenticate as, and the token that proves it. Memory only, because
+	// they are useful only while the task's tunnel is — a restart loses the tunnel
+	// anyway, and a task that resumes is re-registered when its agents are rebuilt.
+	taskCredsMu sync.Mutex
+	taskCreds   map[int64]taskCred
+	// 隧道注册表。只活在内存里：隧道是进程内的，重启即失效，所以没有"重启后仍绑着一条
+	// 死隧道"的持久状态需要校验。将来若做持久化，启动时应把绑了但探不通的标记为需重建。
+	tunnelMu      sync.Mutex
+	tunnels       map[string]*Tunnel
+	tunnelsByTask map[int64][]string
+	tunnelOpener  tunnelOpener // nil = 用内嵌 suo5 客户端；测试注入假实现
+	// 健康巡检节奏。0 = 用包内默认值；测试会调快它们，好把"判定不可用 → 拒绝连接"这条
+	// 路径真的跑一遍，而不是靠等 30 秒。
+	tunnelProbeEvery    time.Duration
+	tunnelProbeFailures int
+}
+
+// taskCred is one task's credentials on the recording listener.
+type taskCred struct {
+	identity string
+	token    string
 }
 
 // Settings keys the UI toggles at runtime.
@@ -374,8 +405,23 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		log.Printf("[llmusage] create table: %v", err)
 	}
 	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
+	// 平台文件库：把隧道载荷落到 data/files/ 并写好 manifest.json，让 agent 自己发现、
+	// 自己取用（见 payloads 包）。失败只记日志：没有文件库不影响其它功能，但会明确说
+	// 出来，避免 agent 以为文件存在。
+	if man, err := payloads.Sync(dir); err != nil {
+		log.Printf("[payloads] 文件库初始化失败: %v", err)
+	} else {
+		log.Printf("[payloads] 文件库就绪: %s（%d 个文件，描述见 %s）", man.Dir, len(man.Files), payloads.ManifestName)
+	}
 	if proxyAddr != "" {
 		tr, err := traffic.Open(filepath.Join(dir, "traffic"), proxyAddr)
+		// 透明连接没有握手，身份只能由 peer uid 反查（每任务一个 uid）。
+		tr.SetIdentityFromUID(func(uid int) string {
+			if task := m.TaskIDForAgentUID(uid); task != "" {
+				return "task" + task
+			}
+			return ""
+		})
 		if err != nil {
 			log.Printf("[traffic] disabled: %v", err)
 		} else {
@@ -410,6 +456,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	// Asset auto-completion engine (§5): HTTP probes routed through the recording
 	// proxy (via m.ProxyAddr, which honors the traffic-capture toggle).
 	m.trafficOn = pg.GetBool(settingTrafficCapture, false)
+	m.agentUIDs = newAgentUIDs()
 	// LLM 录制开关（默认关）。录制器每次调用时读取此标志。
 	m.llmRecOn = pg.GetBool(settingLLMRecord, false)
 	// Load persisted web-search config (default: off, ddgs).
@@ -654,8 +701,14 @@ func (m *Manager) syncBrowserMCPProxy() {
 		return // user removed/renamed it — leave it alone
 	}
 
-	proxy := m.ProxyAddr()  // "" when capture off
-	cert := m.ProxyCACert() // "" when capture off
+	// MCP servers are configured PER SERVER and shared by every task, so this one gets
+	// the plain listener address and stays on the default egress. It deliberately does
+	// NOT follow an individual task's egress: that would need one server config per
+	// task. Its traffic is still recorded, but unattributed (no identity, task_id 0).
+	// Chromium speaks SOCKS5 too, and the HTTP proxy branch is gone: the browser
+	// goes through the same single ingress as everything else.
+	proxy := strings.Replace(m.ProxySocksAddr(), "socks5h://", "socks5://", 1) // "" when capture off
+	cert := m.ProxyCACert()                                                    // "" when capture off
 
 	args := stripProxyArgs(decodeStrSlice(srv.Args))
 	env := decodeStrMap(srv.Env)
@@ -764,6 +817,150 @@ func (m *Manager) ProxyCACert() string {
 		return ""
 	}
 	return m.traffic.CACertPath()
+}
+
+// ProxySocksAddr returns the recording listener's SOCKS5 URL. Non-empty ONLY
+// when capture is on: the ingress shares the recording proxy's port, so with
+// capture off there is nothing to point at — agents then get the global egress
+// proxy directly, which is an arbitrary forwarder that may not speak SOCKS5 at
+// all. Empty is the agents' "no SOCKS5 endpoint" signal (see proxyEnv), which is
+// also why it is a separate value from ProxyAddr rather than a derived scheme.
+func (m *Manager) ProxySocksAddr() string {
+	if m.traffic == nil || !m.TrafficEnabled() {
+		return ""
+	}
+	return m.traffic.SocksAddr()
+}
+
+// TaskEgressLabel names what a task's traffic currently leaves through: "" means the
+// default egress, a non-empty value is that task's own egress (a tunnel).
+func (m *Manager) TaskEgressLabel(taskID int64) string {
+	identity, _, ok := m.taskCredFor(taskID)
+	if !ok || m.traffic == nil {
+		return ""
+	}
+	return m.traffic.IdentityEgressLabel(identity)
+}
+
+// PayloadDir is the platform file library's directory. Agents read manifest.json
+// there to learn which tunnel payload exists and what each one needs.
+func (m *Manager) PayloadDir() string { return payloads.Dir(m.dir) }
+
+// TaskIdentity returns the task's identity and token on the recording listener,
+// generating them on first use, and registers them so the listener accepts the
+// credential. Registration alone binds no egress: the task keeps the default one
+// until something binds a tunnel for it, which is what makes a tunnel a per-task
+// decision rather than a platform-wide one.
+//
+// Called every time a task's agents are built, so it is idempotent and never
+// disturbs an egress already bound to the identity.
+func (m *Manager) TaskIdentity(taskID int64) (identity, token string) {
+	if taskID <= 0 {
+		return "", ""
+	}
+	m.taskCredsMu.Lock()
+	if m.taskCreds == nil {
+		m.taskCreds = make(map[int64]taskCred)
+	}
+	cred, ok := m.taskCreds[taskID]
+	if !ok {
+		buf := make([]byte, 16)
+		if _, err := rand.Read(buf); err != nil {
+			m.taskCredsMu.Unlock()
+			log.Printf("[traffic] 任务 %d 生成代理凭据失败: %v", taskID, err)
+			return "", ""
+		}
+		cred = taskCred{identity: fmt.Sprintf("task%d", taskID), token: hex.EncodeToString(buf)}
+		m.taskCreds[taskID] = cred
+	}
+	m.taskCredsMu.Unlock()
+	if m.traffic != nil && m.TrafficEnabled() {
+		m.traffic.SetIdentity(cred.identity, cred.token, taskID)
+	}
+	return cred.identity, cred.token
+}
+
+// TaskProxyAddrs returns the proxy addresses a task's agents and tools must use:
+// the recording listener carrying the task's credentials, so the listener can tell
+// whose connection it is and route it to that task's egress. Without a listener
+// there is nothing to authenticate against and the plain addresses stand — with
+// capture off the agent talks to the global proxy directly.
+//
+// taskID is the task's id as Task and the API carry it; a non-numeric id is left
+// unauthenticated rather than guessed at.
+func (m *Manager) TaskProxyAddrs(taskID string) (proxyAddr, socksAddr string) {
+	proxyAddr, socksAddr = m.ProxyAddr(), m.ProxySocksAddr()
+	if proxyAddr == "" || m.traffic == nil || !m.TrafficEnabled() {
+		return proxyAddr, socksAddr
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(taskID), 10, 64)
+	if err != nil {
+		return proxyAddr, socksAddr
+	}
+	identity, token := m.TaskIdentity(n)
+	if identity == "" {
+		return proxyAddr, socksAddr
+	}
+	return withCredentials(proxyAddr, identity, token), withCredentials(socksAddr, identity, token)
+}
+
+// ClearTaskIdentity drops a task's listener credentials so the token stops
+// authenticating. Called when the task is deleted; a live task keeps its token for
+// its whole run, because rotating it would invalidate the env its agents already
+// hold.
+func (m *Manager) ClearTaskIdentity(taskID int64) {
+	m.taskCredsMu.Lock()
+	cred, ok := m.taskCreds[taskID]
+	delete(m.taskCreds, taskID)
+	m.taskCredsMu.Unlock()
+	if ok && m.traffic != nil {
+		m.traffic.ClearIdentityEgress(cred.identity)
+	}
+}
+
+// taskCredFor 只读查找任务的凭据，绝不生成。
+//
+// 隧道解绑必须用它而不是 TaskIdentity：任务删除时凭据已经被清掉，而 TaskIdentity 会
+// 顺手重新生成一个并注册回去，留下一个没人认领的僵尸身份。
+func (m *Manager) taskCredFor(taskID int64) (identity, token string, ok bool) {
+	m.taskCredsMu.Lock()
+	defer m.taskCredsMu.Unlock()
+	cred, found := m.taskCreds[taskID]
+	return cred.identity, cred.token, found
+}
+
+// ForgetTaskRuntime drops everything the process holds for a task: its tunnels first
+// (unbinding needs the credential to still exist), then the credential itself. One
+// entry point on purpose — the order is a correctness requirement, not a style
+// choice, so it must not be up to each caller.
+func (m *Manager) ForgetTaskRuntime(id string) {
+	m.ReclaimTaskTunnelsByString(id)
+	m.ClearTaskIdentityByString(id)
+}
+
+// ClearTaskIdentityByString is ClearTaskIdentity for the API layer, where a task is
+// named by its string id. A non-numeric id names no credentials and is ignored.
+func (m *Manager) ClearTaskIdentityByString(id string) {
+	n, err := strconv.ParseInt(strings.TrimSpace(id), 10, 64)
+	if err != nil {
+		return
+	}
+	m.ClearTaskIdentity(n)
+}
+
+// withCredentials inserts user:pass into a proxy URL's userinfo. A URL that already
+// carries credentials keeps them: those are the operator's, for the upstream proxy,
+// and must not be replaced by this listener's.
+func withCredentials(raw, user, pass string) string {
+	if raw == "" || user == "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.User != nil {
+		return raw
+	}
+	u.User = url.UserPassword(user, pass)
+	return u.String()
 }
 
 // GlobalProxy returns the configured global egress proxy URL (empty = direct).
@@ -1113,6 +1310,10 @@ func (m *Manager) LoadExisting() []*Task {
 	}
 	if len(loaded) > 0 {
 		log.Printf("[manager] reloaded %d task(s) from PG", len(loaded))
+		// 收敛必须跨重启存活（否则设置显示开启、内核里没有规则 = fail-open）。
+		// 后台执行：启动路径绝不能等外部命令。
+		m.ApplyEgressLockdownOnBoot()
+		// 启动应用暂缓：见 ApplyEgressLockdownOnBoot 的说明（要放在服务完全起来之后调用）。
 	}
 	return loaded
 }
@@ -1390,6 +1591,11 @@ func (m *Manager) SetTaskStatusGuarded(id, status string) (won bool, err error) 
 	if err != nil || !won {
 		return won, err
 	}
+	if pgdb.IsTerminal(status) {
+		// Terminal: no agent runs again, so the task must not leave a long-lived
+		// connection on the target (nor hold payload slots for nothing).
+		m.ReclaimTaskTunnels(n)
+	}
 	m.mu.Lock()
 	if t := m.tasks[id]; t != nil {
 		t.updateLifecycle(func(state *taskLifecycleState) {
@@ -1414,6 +1620,11 @@ func (m *Manager) SetTaskStatus(id, status string) error {
 	}
 	if err := m.pg.SetStatus(n, status); err != nil {
 		return err
+	}
+	if pgdb.IsTerminal(status) {
+		// Terminal: no agent runs again, so the task must not leave a long-lived
+		// connection on the target (nor hold payload slots for nothing).
+		m.ReclaimTaskTunnels(n)
 	}
 	m.mu.Lock()
 	if t := m.tasks[id]; t != nil {
@@ -1470,7 +1681,9 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 			if len(p.TrafficHosts) == 0 {
 				return nil
 			}
-			trafficStage, err = m.traffic.StageDeleteHostsExact(p.TrafficHosts)
+			// 按 task_id 删（主机清单作兜底）：只按主机清单会误删同名主机上别的任务的
+			// 流量，也会漏掉"本任务但主机不在清单里"的行。
+			trafficStage, err = m.traffic.StageDeleteForTask(n, p.TrafficHosts)
 			if err != nil {
 				return err
 			}

@@ -20,6 +20,11 @@ set -u
 
 cd "$(dirname "$0")" || exit 1
 
+# S3：agent 命令以专属 uid 运行，任务目录得能被它写；失败不阻塞启动。
+if [ "$(id -u)" = "0" ] && [ -d /app/data ]; then
+	chown -R "${ARTEX_AGENT_UID:-1001}" /app/data 2>/dev/null || true
+fi
+
 BIN=./artex
 [ -x "$BIN" ] || { echo "[artex] 找不到可执行文件 $BIN" >&2; exit 1; }
 

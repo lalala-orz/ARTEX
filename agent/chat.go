@@ -23,14 +23,18 @@ import (
 // LS/Glob/Grep) plus whatever skills/MCP the key is made visible; NO pentest
 // graph/task context is injected (that stays exclusive to MainAgent).
 type ChatAgent struct {
-	prov           llm.Provider
-	model          string
-	workDir        string
-	tx             *transcript.Store
-	window         int
-	proxyAddr      string
-	proxyCACert    string
-	webSearch      WebSearchOpts
+	prov        llm.Provider
+	model       string
+	workDir     string
+	tx          *transcript.Store
+	window      int
+	proxyAddr   string
+	socksAddr   string // same listener's SOCKS5 URL for raw-TCP egress ("" = none)
+	proxyCACert string
+	webSearch   WebSearchOpts
+	// shellEnvFn 给该 agent 的 Bash 子进程补环境，按 run 读（S3 出网收敛用）。
+	shellEnvFn     func() []string
+	lockdownFn     func() bool
 	guard          *guard.Guard // optional; nil disables intercept hooks for chat
 	nonStreamingFn func() bool  // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn   func() bool  // resolver: use experimental noa compaction? (nil = off)
@@ -64,8 +68,36 @@ func (c *ChatAgent) maxTokens() int {
 }
 
 // SetProxy points the chat agent's WebFetch/Bash at the recording proxy plus the
-// CA cert it trusts (empty addr = direct). Kept for parity with the other agents.
-func (c *ChatAgent) SetProxy(addr, caCert string) { c.proxyAddr, c.proxyCACert = addr, caCert }
+// CA cert it trusts, and at the same listener's SOCKS5 endpoint so non-HTTP
+// tooling leaves through the same egress (empty addr = direct). Kept for parity
+// with the other agents.
+func (c *ChatAgent) SetProxy(addr, caCert, socksAddr string) {
+	c.proxyAddr, c.proxyCACert, c.socksAddr = addr, caCert, socksAddr
+}
+
+// shellEnv 返回该 agent 每 run 的额外 shell 环境（nil = 无）。
+func (c *ChatAgent) shellEnv() []string {
+	if c.shellEnvFn == nil {
+		return nil
+	}
+	return c.shellEnvFn()
+}
+
+// SetShellEnv 给该 agent 的 Bash 子进程补环境（S3）。
+func (c *ChatAgent) SetShellEnv(fn func() []string) { c.shellEnvFn = fn }
+
+// lockdown reports whether the kernel confines this agent's egress. Defaults to
+// false when unwired, so a missing hook injects the proxy variables (recorded)
+// rather than letting commands leave unrecorded.
+func (c *ChatAgent) lockdown() bool {
+	if c.lockdownFn == nil {
+		return false
+	}
+	return c.lockdownFn()
+}
+
+// SetEgressLockdown wires the live confinement state for this agent (S3).
+func (c *ChatAgent) SetEgressLockdown(fn func() bool) { c.lockdownFn = fn }
 
 // SetWebSearch selects the web_search backend for the chat agent (off by default).
 func (c *ChatAgent) SetWebSearch(o WebSearchOpts) { c.webSearch = o }
@@ -145,7 +177,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		DeepSeekSearchAPIKey:  ws.DeepSeekAPIKey,
 		DeepSeekSearchModel:   ws.DeepSeekModel,
 		WebSearchProxy:        ws.Proxy,
-		BashEnv:               proxyEnv(c.proxyAddr, c.proxyCACert), // Bash 子命令默认走代理+信任 CA
+		BashEnv:               append(bashEnv(c.proxyAddr, c.proxyCACert, c.socksAddr, c.lockdown()), c.shellEnv()...), // Bash 子命令默认走代理+信任 CA
 		WorkingDir:            sessionWorkDir,
 		MaxTurns:              maxTurns,
 		MaxDuration:           maxDuration,

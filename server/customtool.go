@@ -397,8 +397,12 @@ func execPython(ctx context.Context, interp, key, code string, params map[string
 	defer cancel()
 	c := exec.CommandContext(runCtx, interp, tmp)
 	c.Dir = workDir
-	c.Env = append(os.Environ(), sessionEnv...) // 会话代理 env
-	for k, v := range params {                  // 标量参数镜像成 TOOL_<NAME>
+	c.Env = append(os.Environ(), sessionEnv...) // 会话 env（现在只剩 CA 信任；出网由内核兜底）
+	// 脚本目录与临时文件由平台（root）创建，降权后的子进程要能读到它们。
+	_ = os.Chmod(toolsDir, 0o755)
+	_ = f.Chmod(0o644)
+	applyAgentCredential(c, sessionEnv)
+	for k, v := range params { // 标量参数镜像成 TOOL_<NAME>
 		if sv, ok := scalarStr(v); ok {
 			c.Env = append(c.Env, "TOOL_"+strings.ToUpper(k)+"="+sv)
 		}
@@ -442,7 +446,7 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 		req.Header.Set(k, renderTemplate(v, params, identity))
 	}
 	client := &http.Client{Timeout: timeoutOr(spec.TimeoutMs, 30000)}
-	if tr := s.httpProxyTransport(spec); tr != nil {
+	if tr := s.httpProxyTransport(spec, tc); tr != nil {
 		client.Transport = tr
 	}
 	resp, err := client.Do(req)
@@ -456,15 +460,47 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 	return actool.Text(actool.Capture(tc, string(b))), nil
 }
 
+// envValue returns the value of the first of keys present in a tool call's
+// environment. The harness puts the run's BashEnv there, so this is how a tool reads
+// the egress (and CA) its caller was configured with.
+func envValue(tc *actool.ToolContext, keys ...string) string {
+	if tc == nil {
+		return ""
+	}
+	for _, k := range keys {
+		for _, e := range tc.Env {
+			if v, ok := strings.CutPrefix(e, k+"="); ok {
+				return strings.TrimSpace(v)
+			}
+		}
+	}
+	return ""
+}
+
 // httpProxyTransport builds a Transport for the http tool's proxy config, or nil
 // (direct). use_recording_proxy routes through the recording proxy + trusts its CA.
-func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
+//
+// It resolves the proxy from the CALLER'S environment rather than naming the
+// listener directly: every tool call carries the run's BashEnv in tc.Env, and an
+// agent running for a task has that task's own credentialed proxy URL there. The
+// tool therefore leaves through the task's egress — a tunnel bound for that task
+// included — instead of silently bypassing it, while a caller with no environment of
+// its own still falls back to the listener address.
+func (s *Server) httpProxyTransport(spec httpExec, tc *actool.ToolContext) *http.Transport {
 	proxyStr := strings.TrimSpace(spec.Proxy)
 	var caFile string
 	if spec.UseRecordingProxy {
-		if addr := s.m.ProxyAddr(); addr != "" {
-			proxyStr = "http://" + addr
-			caFile = s.m.ProxyCACert()
+		// HTTP_PROXY, never ALL_PROXY: the latter is a socks5h:// URL for the SOCKS5
+		// ingress, and net/http's Transport does not know that scheme.
+		proxyStr = envValue(tc, "HTTP_PROXY", "http_proxy")
+		if proxyStr == "" {
+			if addr := s.m.ProxyAddr(); addr != "" {
+				proxyStr = "http://" + addr
+			}
+		}
+		caFile = envValue(tc, "SSL_CERT_FILE", "CURL_CA_BUNDLE")
+		if caFile == "" {
+			caFile = s.m.ProxyCACert() // "" unless capture is on; see the field's doc
 		}
 	}
 	if proxyStr == "" {

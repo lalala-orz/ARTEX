@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -470,7 +471,9 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	// chat agent serves MANY custom agents by key → it holds the GLOBAL opts
 	// (backend/key) and gates Enabled per-conversation-agent at Chat time. 对话始终用激活配置。
 	s.chatAgent = agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win) // chat page runner
-	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert(), s.m.ProxySocksAddr())
+	s.chatAgent.SetShellEnv(s.m.AgentShellEnv)
+	s.chatAgent.SetEgressLockdown(s.m.EgressLockdownEnabled)
 	s.chatAgent.SetWebSearch(s.m.WebSearchOpts())
 	s.chatAgent.SetGuard(s.chatGuard())
 	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
@@ -611,7 +614,7 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	}
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
 	ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
-	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert(), s.m.ProxySocksAddr())
 	ca.SetWebSearch(s.m.WebSearchOpts())
 	ca.SetGuard(s.chatGuard())
 	ca.SetNonStreaming(nonStreamingResolver(cfg))
@@ -788,8 +791,34 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/traffic", s.deleteTraffic)
 	mux.HandleFunc("DELETE /api/traffic/hosts", s.deleteTrafficHosts)
 	mux.HandleFunc("DELETE /api/traffic/all", s.deleteAllTraffic)
+	mux.HandleFunc("GET /api/traffic/egresses", s.getTrafficEgresses)
 	mux.HandleFunc("GET /api/traffic/exchange", s.getTrafficExchange)
 	mux.HandleFunc("GET /api/traffic/blob", s.getTrafficBlob)
+	mux.HandleFunc("GET /api/traffic/socks5", s.getTrafficSocks5)
+	mux.HandleFunc("GET /api/traffic/socks5/body", s.getTrafficSocks5Body)
+	// 内网隧道：运行期状态（隧道活在进程里），所以列表接口是它唯一的权威视图；建/关
+	// 与 agent 的 tunnel_up/tunnel_down 走同一套门禁（Manager.OpenTunnel）。
+	mux.HandleFunc("GET /api/tunnels", s.listTunnels)
+	mux.HandleFunc("POST /api/tasks/{id}/tunnel", s.createTaskTunnel)
+	mux.HandleFunc("DELETE /api/tasks/{id}/tunnel", s.deleteTaskTunnel)
+	// 连通性：重探已绑隧道（不改绑定），以及"只测不绑"（建表单里先验一下）。
+	mux.HandleFunc("POST /api/tasks/{id}/tunnel/check", s.checkTaskTunnel)
+	mux.HandleFunc("POST /api/tunnels/probe", s.probeTunnelAddress)
+	// 换一条隧道：旧先关、新建（失败会明确告知已退回 global_proxy）。
+	mux.HandleFunc("POST /api/tasks/{id}/tunnel/replace", s.replaceTaskTunnel)
+	// 某任务的代理环境（含监听器凭据）：手工复现"这个任务的流量到底走哪条出口"用。
+	mux.HandleFunc("GET /api/tasks/{id}/proxy", s.taskProxyEnv)
+	// 平台文件库（隧道载荷及其说明），供 UI 展示与人工取用。
+	mux.HandleFunc("GET /api/payloads", s.listPayloads)
+	mux.HandleFunc("GET /api/payloads/download", s.downloadPayload)
+	// 平台文件库的通用管理（上传/列表/下载/删除）。载荷是这份目录上的一个视图：
+	// /api/payloads 仍然只讲"载荷"，/api/files 讲"文件"。
+	mux.HandleFunc("GET /api/files", s.listFiles)
+	mux.HandleFunc("POST /api/files/upload", s.uploadFiles)
+	mux.HandleFunc("GET /api/files/download", s.downloadFile)
+	mux.HandleFunc("DELETE /api/files", s.deleteFile)
+	mux.HandleFunc("PUT /api/files/meta", s.updateFileMeta)
+	mux.HandleFunc("POST /api/files/revert", s.revertFile)
 	mux.HandleFunc("GET /api/commands", s.pgListCommands)
 	mux.HandleFunc("GET /api/commands/stats", s.pgToolStats) // 按工具聚合调用次数
 	mux.HandleFunc("GET /api/llm/records", s.pgListLLMRecords)
@@ -1443,18 +1472,20 @@ func truncateReply(s string) string {
 }
 
 type createTaskReq struct {
-	Name                 string   `json:"name,omitempty"` // 可选任务名称;省略/空=未命名
-	CategoryID           *int64   `json:"category_id,omitempty"`
-	Description          string   `json:"description"`
-	Goal                 string   `json:"goal"`
-	LLMProfileID         *int64   `json:"llm_profile_id,omitempty"`    // 指定运行本任务的 LLM 配置;省略/null=用激活配置
-	LLMProfileIDs        []int64  `json:"llm_profile_ids,omitempty"`   // 有序任务级配置链;第一项初始生效
-	SourceTaskIDs        []string `json:"source_task_ids,omitempty"`   // 仅直接、只读继承的来源任务
-	CompanyIDs           []int64  `json:"company_ids,omitempty"`       // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
-	TimeoutSeconds       int      `json:"timeout_seconds"`             // 任务级超时(秒);0/省略=不限时
-	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
-	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
-	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
+	// Egress 是建任务时可选填的出口（只支持"我已有的隧道/代理"：socks5/http）。
+	Egress               *TaskEgressReq `json:"egress,omitempty"`
+	Name                 string         `json:"name,omitempty"` // 可选任务名称;省略/空=未命名
+	CategoryID           *int64         `json:"category_id,omitempty"`
+	Description          string         `json:"description"`
+	Goal                 string         `json:"goal"`
+	LLMProfileID         *int64         `json:"llm_profile_id,omitempty"`    // 指定运行本任务的 LLM 配置;省略/null=用激活配置
+	LLMProfileIDs        []int64        `json:"llm_profile_ids,omitempty"`   // 有序任务级配置链;第一项初始生效
+	SourceTaskIDs        []string       `json:"source_task_ids,omitempty"`   // 仅直接、只读继承的来源任务
+	CompanyIDs           []int64        `json:"company_ids,omitempty"`       // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
+	TimeoutSeconds       int            `json:"timeout_seconds"`             // 任务级超时(秒);0/省略=不限时
+	PlanHeartbeatSeconds int            `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
+	SeedFirstIntent      *bool          `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
+	CoverageEnabled      *bool          `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
 }
@@ -1531,6 +1562,15 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
 	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。
 	s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
+	// 建任务时填的出口（可选）：先记成"待生效"再立刻尝试绑定。
+	// 任务照建 —— 出口问题不该挡住建任务；没生效就留在待生效表里等重试（见 task_egress.go）。
+	if req.Egress != nil {
+		if n, convErr := strconv.ParseInt(strings.TrimSpace(t.ID), 10, 64); convErr == nil {
+			if bindErr := registerTaskEgress(s.m, n, req.Egress.Kind, req.Egress.URL, req.Egress.Probe, req.Egress.Upstream); bindErr != nil {
+				log.Printf("[task] 任务 #%s 的出口暂未生效：%v", t.ID, bindErr)
+			}
+		}
+	}
 	writeJSON(w, 201, taskDTO(t, s.resolvedTaskStatus(t)))
 }
 
@@ -1650,18 +1690,31 @@ func schemeForPort(p int) string {
 	return "http"
 }
 
-// llmHost returns the host of the configured LLM endpoint (to keep it out of scope).
-func (s *Server) llmHost() string {
+// llmHostPort 返回已配置的 LLM 端点的 host 与端口，用来把网关本身排除在目标之外。
+func (s *Server) llmHostPort() (string, int) {
 	s.cfgMu.Lock()
 	base := s.llmCfg.BaseURL
 	s.cfgMu.Unlock()
 	if base == "" {
-		return ""
+		return "", 0
 	}
-	if u, err := url.Parse(base); err == nil {
-		return strings.ToLower(u.Hostname())
+	u, err := url.Parse(base)
+	if err != nil || u.Hostname() == "" {
+		return "", 0
 	}
-	return ""
+	scheme := strings.ToLower(u.Scheme)
+	return strings.ToLower(u.Hostname()), portOr(u.Port(), defaultPort(scheme))
+}
+
+// isLLMGatewayTarget 判断"这个渗透目标是不是 LLM 网关自己"。
+//
+// 必须比到**端口**：同一台机器上经常既有网关又有靶场/业务（本次就遇到 39.98.119.49:80 是网关、
+// :18080 是需要测试的靶场）。只比 host 会把这些端口一起挡掉，把正常任务误伤。
+func isLLMGatewayTarget(gwHost string, gwPort int, host string, port int) bool {
+	if gwHost == "" || gwPort == 0 {
+		return false
+	}
+	return strings.EqualFold(host, gwHost) && port == gwPort
 }
 
 func (s *Server) seed(t *Task, text string) {
@@ -1671,8 +1724,9 @@ func (s *Server) seed(t *Task, text string) {
 		return
 	}
 	// P0-1 guard: never treat the configured LLM gateway as a target.
-	if gw := s.llmHost(); gw != "" && host == gw {
-		log.Printf("[seed] task %s: 目标 %q 是 LLM 网关，拒绝作为渗透目标", t.ID, host)
+	// 注意只挡"网关那一个 host:port"——同主机的其它端口（靶场、业务）照常放行（见 isLLMGatewayTarget）。
+	if gwHost, gwPort := s.llmHostPort(); isLLMGatewayTarget(gwHost, gwPort, host, port) {
+		log.Printf("[seed] task %s: 目标 %s:%d 就是 LLM 网关（与网关同主机同端口），拒绝作为渗透目标", t.ID, host, port)
 		return
 	}
 
@@ -3107,27 +3161,35 @@ func (s *Server) getTraffic(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	page := atoiDefault(q.Get("page"), 0)
 	size := atoiDefault(q.Get("size"), 100)
-	ex, matched, _ := tr.Page(traffic.PageQuery{
+	rows, matched, _ := tr.PageUnified(traffic.PageQuery{
 		Host:    q.Get("host"),
 		Method:  q.Get("method"),
 		Query:   q.Get("q"),
 		Body:    q.Get("body"),
 		Path:    q.Get("path"),
 		Status:  q.Get("status"),
-		RespMin: int64(atoiDefault(q.Get("resp_min"), -1)),
-		RespMax: int64(atoiDefault(q.Get("resp_max"), -1)),
-		Sort:    q.Get("sort"),
-		Order:   q.Get("order"),
+		RespMin: int64Ptr(q.Get("resp_min")),
+		RespMax: int64Ptr(q.Get("resp_max")),
+		// Attributed-egress filters: the page uses them to answer which task this is and
+		// what actually left through a proxy or a tunnel.
+		TaskID:       int64(atoiDefault(q.Get("task_id"), 0)),
+		Unattributed: q.Get("unattributed") == "1",
+		TCPWithBody:  q.Get("tcp_body") == "1",
+		Identity:     q.Get("identity"),
+		Egress:       q.Get("egress"),
+		Sort:         q.Get("sort"),
+		Order:        q.Get("order"),
 	}, page, size)
 	count, _ := tr.Count() // global total, for the stat card
 	writeJSON(w, 200, map[string]any{
 		"enabled":   s.m.TrafficEnabled(), // reflect the capture toggle
 		"proxy":     s.m.ProxyAddr(),
-		"count":     count,   // total recorded (unfiltered)
-		"total":     matched, // rows matching the current filter (for pagination)
+		"socks":     s.m.ProxySocksAddr(), // same listener's SOCKS5 URL ("" = none)
+		"count":     count,                // total recorded (unfiltered)
+		"total":     matched,              // rows matching the current filter (for pagination)
 		"page":      page,
 		"size":      size,
-		"exchanges": trafficDTOs(ex),
+		"exchanges": unifiedDTOs(rows),
 	})
 }
 
@@ -3275,6 +3337,89 @@ func (s *Server) getTrafficBlob(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// getTrafficSocks5 returns one page of the raw-TCP SOCKS5 ledger: the non-HTTP
+// connections the recording listener relayed (databases, agent-authored scripts).
+// Metadata only — the relayed bytes are never captured, which is why this is a
+// separate list from the exchange index rather than part of it.
+func (s *Server) getTrafficSocks5(w http.ResponseWriter, r *http.Request) {
+	tr := s.m.Traffic()
+	if tr == nil {
+		writeJSON(w, 200, map[string]any{"enabled": false, "socks": "", "connections": []any{}})
+		return
+	}
+	q := r.URL.Query()
+	page := atoiDefault(q.Get("page"), 0)
+	size := atoiDefault(q.Get("size"), 100)
+	rows, total, err := tr.Socks5Conns(q.Get("host"), page, size)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if rows == nil {
+		rows = []traffic.Socks5Conn{}
+	}
+	writeJSON(w, 200, map[string]any{
+		"enabled":     s.m.TrafficEnabled(),
+		"socks":       s.m.ProxySocksAddr(),
+		"total":       total,
+		"page":        page,
+		"size":        size,
+		"connections": rows,
+	})
+}
+
+// getTrafficSocks5Body returns the captured head of one raw-TCP connection. Only
+// recognised database services have one stored (see traffic.classifySocks5Service).
+// The head is raw protocol bytes, so it is sent base64-encoded next to a lossy
+// text rendering the UI can display directly.
+func (s *Server) getTrafficSocks5Body(w http.ResponseWriter, r *http.Request) {
+	tr := s.m.Traffic()
+	if tr == nil {
+		writeErr(w, 503, "流量记录未启用")
+		return
+	}
+	id := atoiDefault(r.URL.Query().Get("id"), 0)
+	if id <= 0 {
+		writeErr(w, 400, "缺少连接 id")
+		return
+	}
+	service, up, down, ok, err := tr.Socks5Body(int64(id))
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if !ok {
+		writeErr(w, 404, "该连接没有保存正文（未识别的服务，或捕获未开）")
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"id":        id,
+		"service":   service,
+		"up_head":   base64.StdEncoding.EncodeToString(up),
+		"down_head": base64.StdEncoding.EncodeToString(down),
+		"up_text":   printableSocks5Head(up),
+		"down_text": printableSocks5Head(down),
+	})
+}
+
+// printableSocks5Head renders raw protocol bytes for display: printable ASCII
+// stays, everything else (including CR/LF) becomes a dot so the layout survives.
+func printableSocks5Head(b []byte) string {
+	const maxHead = 8192
+	if len(b) > maxHead {
+		b = b[:maxHead]
+	}
+	out := make([]byte, 0, len(b))
+	for _, c := range b {
+		if c >= 0x20 && c < 0x7f {
+			out = append(out, c)
+		} else {
+			out = append(out, '.')
+		}
+	}
+	return string(out)
+}
+
 // getSettings returns the runtime app settings the UI toggles. The Brave API key
 // is returned as a boolean presence flag (brave_key_set), never the value itself,
 // so the UI can show "configured" without echoing the secret back.
@@ -3290,8 +3435,15 @@ func (s *Server) settingsPayload() map[string]any {
 		concLimit = defaultConcurrencyLimit // 关闭时也回显一个合理默认值给 UI
 	}
 	return map[string]any{
-		"traffic_capture":          s.m.TrafficEnabled(),
-		"agent_traffic_binding":    s.m.pg.GetBool(settingAgentTrafficBinding, false),
+		"traffic_capture":       s.m.TrafficEnabled(),
+		"agent_traffic_binding": s.m.pg.GetBool(settingAgentTrafficBinding, false),
+		// agent 出网是否已被内核收敛到监听器：agent 的每条 TCP 被 REDIRECT 进监听器
+		// （透明兜底，agent 侧零配置）。root（平台）不匹配规则，所以它的出网不受影响。
+		"agent_egress_lockdown": s.m.EgressLockdownEnabled(),
+		// 任务 → uid：出网收敛按 uid 分流与认身份，运维要能对上号。
+		"agent_uid_map": s.m.AgentUIDMap(),
+		// 规则实况：设置说开启 ≠ 内核里真有规则。绝不谎报。
+		"agent_egress_rules":       s.m.EgressRulesState(),
 		"llm_record":               s.m.LLMRecordEnabled(),
 		"web_search_enabled":       on,
 		"web_search_backend":       backend,
@@ -3362,6 +3514,8 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		TrafficCapture      *bool `json:"traffic_capture"`
 		AgentTrafficBinding *bool `json:"agent_traffic_binding"`
+		// AgentEgressLockdown 打开后，agent 的命令以每任务专属 uid 运行，其 TCP 被内核重定向进监听器。
+		AgentEgressLockdown *bool `json:"agent_egress_lockdown"`
 		LLMRecord           *bool `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
 		// Web search. WebSearchEnabled/Backend toggle the tool + backend; BraveKey/TavilyKey
 		// are optional — omit (null) to leave a stored key untouched, send "" to clear.
@@ -3510,10 +3664,28 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.AgentEgressLockdown != nil {
+		// 失败必须回给调用方：没有 CAP_NET_ADMIN 或规则不可用时，不能让人以为已经收敛了。
+		if err := s.m.ApplyEgressLockdown(*req.AgentEgressLockdown); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+	}
 	if req.TrafficCapture != nil {
 		if err := s.m.SetTrafficEnabled(*req.TrafficCapture); err != nil {
 			writeErr(w, 500, err.Error())
 			return
+		}
+		if *req.TrafficCapture {
+			// Capture just came up. A boot that found no listener skips the rules on
+			// purpose (confining the agent to a dead listener breaks every command),
+			// so the confinement has to be reconciled here — otherwise the setting
+			// claims something the kernel does not hold.
+			s.m.ApplyEgressLockdownOnBoot()
+		} else if s.m.EgressLockdownEnabled() {
+			// The mirror image, and the more dangerous one: with the listener down,
+			// redirecting the agent would reset every command instead of recording it.
+			s.m.SuspendEgressRules("监听器已停止（捕获关闭）")
 		}
 		changed = true
 	}

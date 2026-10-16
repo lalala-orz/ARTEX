@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -49,7 +50,8 @@ CREATE TABLE IF NOT EXISTS exchanges (
   content_type TEXT,
   req_len      INTEGER,
   resp_len     INTEGER,
-  path         TEXT
+  path         TEXT,
+  task_id      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_ex_host ON exchanges(host);
 CREATE INDEX IF NOT EXISTS idx_ex_tmpl ON exchanges(host, url_template);
@@ -126,21 +128,102 @@ const (
 	// reclaimBudget caps one background reclamation. Deleting a busy host can free
 	// gigabytes, and the next deletion resumes wherever this one stopped.
 	reclaimBudget = 5 * time.Minute
+	// egressLogInterval rate-limits the "egress unreachable" log line, in seconds.
+	// While an egress is down EVERY request through its listener fails with the
+	// same error, so without this the journal would get one identical line per
+	// request. The first failure (logged-at == 0) is always written.
+	// recordQueueDepth absorbs a burst of concurrent responses without blocking them.
+	// A full queue blocks (backpressure) rather than dropping a recorded exchange.
+	recordQueueDepth  = 4096
+	egressLogInterval = 60
+	// egressProbeInterval throttles the active egress probe, in seconds. The probe
+	// is what catches an egress death on the plaintext path, where go-mitmproxy
+	// panics inside its own dial helper before any addon can report anything (see
+	// sink.Requestheaders). Probing on every request would be wasteful; probing
+	// never would leave that death invisible.
+	egressProbeInterval = 30
+	// egressProbeTimeout bounds one active probe, so a proxy that accepts TCP and
+	// then says nothing costs one short-lived goroutine instead of a leak.
+	egressProbeTimeout = 3 * time.Second
 )
 
 // TrafficSearchDescription is persisted into the tool catalog for new and
 // upgraded installations. Keep it in the traffic package so the runtime tool
 // and the catalog migration cannot drift apart.
-const TrafficSearchDescription = "查询记录代理已抓取的目标流量（必须指定 host；支持裸主机、主机:端口或完整 URL，可再按 URL 子串或正文关键词过滤）。指定端口时只返回该服务的流量，避免同一 IP 的不同端口串包。body_contains 会在已抓取的请求/响应头与正文中做全文搜索，支持任意子串和中文（至少 3 个字符）。仅返回极轻量索引(id/method/url/status/resp_len)，不含响应内容；结果非空后必须用 traffic_get 逐条核实请求/响应，再把确实支持当前漏洞的 ID 交给 bind_finding_traffic。默认只返回 3 条、每页最多 10 条；结果多时用 page 翻页。"
+const TrafficSearchDescription = "查询记录代理已抓取的目标流量（host 可选；支持裸主机、主机:端口或完整 URL，可再按 URL 子串或正文关键词过滤）。指定端口时只返回该服务的流量，避免同一 IP 的不同端口串包。body_contains 会在已抓取的请求/响应头与正文中做全文搜索，支持任意子串和中文（至少 3 个字符）；**证据常出现在代理端点（RCE/上传接口）的响应体里，此时应按证据关键串检索那条交换，而不是按证据所属主机检索**。默认按调用者所属任务限定范围，可用 task_id 覆盖。仅返回极轻量索引(id/method/url/status/resp_len + task_id/identity/egress)，不含响应内容；结果非空后必须用 traffic_get 逐条核实请求/响应，再把确实支持当前漏洞的 ID 交给 bind_finding_traffic。默认只返回 3 条、每页最多 10 条；结果多时用 page 翻页。"
+
+// EgressState is the last observed health of one listener's upstream egress.
+//
+// It exists because an unreachable upstream is the ONE failure a client cannot
+// see: on the plaintext-HTTP path go-mitmproxy's attack() panics before writing a
+// status code, its own recover() eats the panic, and net/http then renders that
+// silence as an empty 200 OK. The exchange never reaches the sink either, so it is
+// not recorded and nothing survives anywhere. Reported so a dead tunnel/proxy is
+// distinguishable from a genuinely empty resource.
+type EgressState struct {
+	OK        bool   `json:"ok"`
+	Reason    string `json:"reason,omitempty"`
+	CheckedAt int64  `json:"checked_at,omitempty"` // unix seconds
+}
 
 // Traffic runs the recording proxy and owns the file tree + index.
+// listener is one go-mitmproxy instance: its own TCP port and its own egress
+// upstream, sharing the Traffic store (SQLite index, blobs, CA) with every other
+// listener.
+//
+// Ports are what give each task an independent egress while still recording into
+// ONE store. The alternative — one Traffic instance per egress — was rejected
+// because the index is a single SQLite file: two *sql.DB handles onto it would
+// contend on the write lock, and splitting the stores would put half the captured
+// traffic beyond the reach of the traffic page and its agent tools.
+type listener struct {
+	id     string // "global", or "task:<id>"
+	taskID int64  // 0 for the shared listener
+	addr   string // fixed at creation: agents bake it into HTTP_PROXY, so it must not move
+	proxy  *mproxy.Proxy
+	// upstream is this listener's egress (nil = direct). Atomic so it can be
+	// re-pointed at runtime without rebuilding the proxy; the next dial sees it.
+	upstream atomic.Pointer[url.URL]
+	// egress is this listener's upstream egress health, as last observed. It exists
+	// because an unreachable upstream is the only failure the CLIENT cannot see: on
+	// the plaintext-HTTP path go-mitmproxy's attack() panics, its own recover() eats
+	// the panic, the ResponseWriter is never written, and net/http renders that
+	// silence into an empty 200 OK — and the exchange never reaches the sink, so it
+	// is not recorded either. Without this state an egress can be dead while the
+	// platform looks perfectly healthy.
+	egress atomic.Pointer[EgressState]
+	// egressLoggedAt is the unix second of the last "egress unreachable" log line,
+	// used to rate-limit it: while the egress is down every request through this
+	// listener fails, and none of them deserves its own identical log line. Zero
+	// means "never logged", so the first failure always gets through.
+	egressLoggedAt atomic.Int64
+	// egressProbedAt is the unix second of the last active probe of this listener's
+	// upstream. Separate from egressLoggedAt because a probe may find the egress
+	// healthy (nothing to log) and must still not be repeated on every request.
+	egressProbedAt atomic.Int64
+}
+
 type Traffic struct {
-	dir   string
-	addr  string
-	db    *sql.DB
-	wmu   sync.Mutex // serializes record() vs DeleteHost (incl. blob GC)
-	seq   atomic.Int64
-	proxy *mproxy.Proxy
+	// identityFromUID 见 SetIdentityFromUID。
+	identityFromUID func(uid int) string
+	dir             string
+	addr            string
+	db              *sql.DB
+	wmu             sync.Mutex // serializes writeExchange() vs DeleteHost (incl. blob GC)
+	// Recording is off the response path: sink.Response only snapshots the flow and
+	// enqueues, and one goroutine owns every SQLite write. See enqueue/recordLoop.
+	recCh   chan pendingExchange
+	recDone chan struct{}
+	// recMu guards recShut/recCh so a send can never race the close in stopRecords.
+	recMu   sync.RWMutex
+	recShut bool
+	// blobMu guards spill(): it writes blob files and derives their names, and it
+	// used to run only under wmu on the recording path. enqueue calls it from many
+	// connection goroutines at once, so it needs its own lock — sharing wmu would
+	// put the response path back behind the SQLite transaction.
+	blobMu sync.Mutex
+	seq    atomic.Int64
+	proxy  *mproxy.Proxy
 	// fts reports whether the full-text index is available. False on a driver
 	// build without FTS5: recording and metadata search still work, body search
 	// degrades to unsupported rather than erroring.
@@ -165,15 +248,80 @@ type Traffic struct {
 	// reason; connections to them are tunneled transparently (fail-open) so the
 	// request still reaches the target — unrecorded — instead of being killed.
 	pass sync.Map // hostname(string) -> struct{}
-	// upstream is the global egress proxy every captured request is forwarded
-	// through (nil = dial targets directly). Both the intercepted and the
-	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
-	// so no host escapes it. Hot-swappable at runtime via SetUpstreamProxy.
-	upstream atomic.Pointer[url.URL]
+	// egress is the DEFAULT outbound path every captured connection leaves through
+	// (nil = direct dial). Both the intercepted and the transparent-passthrough
+	// paths honor it (go-mitmproxy's getUpstreamConn), so no host escapes it.
+	// Hot-swappable at runtime via SetUpstreamProxy/SetUpstreamDialer. An identity
+	// bound with SetIdentityEgress overrides it for that identity's connections.
+	egress atomic.Pointer[egress]
+	// identities maps an authenticated identity to its own egress. Populated when a
+	// task binds a tunnel; empty in a single-tenant install, where the default
+	// egress above is all there is. sync.Map because connections look themselves up
+	// from many goroutines while bindings change.
+	identities sync.Map // identity(string) -> *identityEgress
+	// identityCount mirrors len(identities) so diagnostics and the cheap "is anything
+	// bound" checks do not walk the map.
+	identityCount atomic.Int64
+	// authOverride is WithAuthenticate's hook, when the caller supplied one. It wins
+	// over the identity registry.
+	authOverride func(user, pass string) (identity string, ok bool)
+}
+
+// SetIdentityFromUID 注入 uid → 身份的解析器（透明兜底：连接没有握手，只能靠 peer uid 认人）。
+func (t *Traffic) SetIdentityFromUID(fn func(uid int) string) { t.identityFromUID = fn }
+
+// egress is one outbound path: a URL proxy, an injected dialer (a task's tunnel,
+// say), or direct when the holder itself is nil. Exactly one of url/dialer is set.
+type egress struct {
+	url    *url.URL
+	dialer Dialer
+	label  string
+}
+
+// identityEgress is the egress bound to one authenticated identity, plus the token
+// that authenticates it and the task it belongs to, so the ledger can attribute a
+// row without re-deriving either.
+type identityEgress struct {
+	token  string
+	taskID int64
+	egress *egress
+}
+
+// Dialer is an egress that opens connections itself, such as a task's in-process
+// tunnel. Describe must be redacted (no credentials): the ledger records it as the
+// answer to "where did this connection actually go".
+type Dialer interface {
+	Dial(ctx context.Context, addr string) (net.Conn, error)
+	Describe() string
+}
+
+// Option configures the recording proxy at construction. Options are variadic
+// so every existing two-argument Open call keeps compiling unchanged.
+type Option func(*proxyConfig)
+
+// proxyConfig collects the Option-settable knobs before the proxy is built.
+type proxyConfig struct {
+	authenticate func(user, pass string) (identity string, ok bool)
+}
+
+// WithAuthenticate identifies the client using the listener, for both ingresses:
+// the SOCKS5 greeting (RFC 1929) and the HTTP Proxy-Authorization header. The
+// returned identity is remembered per connection and handed to the egress layer,
+// which is what lets one listener route different clients to different egresses.
+// Return ok=false to reject the client.
+//
+// nil (the default) accepts anyone with an empty identity. The egress proxy's own
+// credentials stay in the upstream URL and are never conflated with these.
+func WithAuthenticate(fn func(user, pass string) (identity string, ok bool)) Option {
+	return func(c *proxyConfig) { c.authenticate = fn }
 }
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
-func Open(dir, addr string) (*Traffic, error) {
+func Open(dir, addr string, opts ...Option) (*Traffic, error) {
+	var cfg proxyConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 	for _, d := range []string{dir, filepath.Join(dir, "_index"), filepath.Join(dir, "_blobs"), filepath.Join(dir, "_ca")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return nil, err
@@ -195,7 +343,10 @@ func Open(dir, addr string) (*Traffic, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &Traffic{dir: dir, addr: addr, db: db, closed: make(chan struct{})}
+	t := &Traffic{dir: dir, addr: addr, db: db, closed: make(chan struct{}), authOverride: cfg.authenticate}
+	t.recCh = make(chan pendingExchange, recordQueueDepth)
+	t.recDone = make(chan struct{})
+	go t.recordLoop()
 	if err := t.initIndex(); err != nil {
 		db.Close()
 		return nil, err
@@ -205,20 +356,63 @@ func Open(dir, addr string) (*Traffic, error) {
 		Addr:        addr,
 		SslInsecure: true,
 		CaRootPath:  filepath.Join(dir, "_ca"),
+		// SOCKS5 shares this port: the first client byte selects the protocol.
+		// A TLS CONNECT is MITM'd through the very same attacker/CA/addon
+		// pipeline as an HTTP CONNECT; any other payload is relayed as raw TCP
+		// through the upstream chosen below, and reported here as metadata.
+		Authenticate: t.authenticate,
+		// 透明兜底：连接由内核重定向而来、没有握手，只能靠 peer uid 认身份。
+		IdentityFromUID: func(uid int) string {
+			if t.identityFromUID == nil {
+				return ""
+			}
+			return t.identityFromUID(uid)
+		},
+		EgressLabel: t.egressLabelFor,
+		// Keep a bounded head of each direction for database ports only: that is
+		// where the evidence is (handshake, first statements) and it keeps every
+		// other relay allocation-free.
+		Socks5CaptureBytes: socks5CaptureHeadBytes,
+		Socks5CapturePorts: Socks5CapturePorts(),
+		Socks5RawMeta: func(m mproxy.Socks5RawMeta) {
+			// The relay finishes off the request path. Write in the background so
+			// a busy index never delays a session teardown — recordSocks5Conn
+			// takes no write lock of its own.
+			service := classifySocks5Service(m.Port, m.HeadUp, m.HeadDown)
+			go t.recordSocks5Conn(Socks5Conn{
+				TS:          time.Now().Unix(),
+				ListenerID:  GlobalListenerID,
+				TaskID:      t.identityTaskID(m.Identity),
+				Identity:    m.Identity,
+				DstHost:     m.Host,
+				DstPort:     m.Port,
+				BytesUp:     m.BytesUp,
+				BytesDown:   m.BytesDown,
+				ViaUpstream: m.ViaUpstream,
+				Egress:      m.Egress,
+				Service:     service,
+				HeadUp:      m.HeadUp,
+				HeadDown:    m.HeadDown,
+			})
+		},
 	})
 	if err != nil {
 		db.Close()
 		return nil, err
 	}
-	// Upstream selection. By default (no global egress proxy set) targets are
-	// dialed DIRECTLY: go-mitmproxy's own default upstream uses
-	// http.ProxyFromEnvironment, so an HTTP_PROXY/HTTPS_PROXY in the environment
-	// (a VPN/system proxy) would make it forward target requests through that
-	// external proxy — which can't reach the target → 502. Returning nil forces
-	// a direct dial. When a global egress proxy IS configured (SetUpstreamProxy),
-	// every captured request — intercepted AND transparently tunneled — is
-	// forwarded through it instead, so no host leaks the real source IP.
-	p.SetUpstreamProxy(func(*http.Request) (*url.URL, error) { return t.upstream.Load(), nil })
+	// Upstream selection. By default (no egress set) targets are dialed DIRECTLY:
+	// go-mitmproxy's own default upstream uses http.ProxyFromEnvironment, so an
+	// HTTP_PROXY/HTTPS_PROXY in the environment (a VPN/system proxy) would make it
+	// forward target requests through that external proxy — which can't reach the
+	// target → 502. Returning nil forces a direct dial. When a global egress proxy
+	// IS configured (SetUpstreamProxy), every captured request — intercepted AND
+	// transparently tunneled — is forwarded through it instead, so no host leaks
+	// the real source IP. An injected dialer (SetUpstreamDialer) takes precedence
+	// and is what go-mitmproxy consults first.
+	p.SetUpstreamProxy(func(*http.Request) (*url.URL, error) { return t.upstreamURL(), nil })
+	// No dialer hook yet: go-mitmproxy treats a non-nil one as "the dialer owns the
+	// egress", so installing it here would disable the URL upstream above.
+	// SetUpstreamDialer installs and clears it as the egress changes.
 	// Fail-open: MITM every host by default, EXCEPT ones a prior request proved we
 	// can't intercept without breaking (see maybePassthrough). Those are tunneled
 	// transparently so the request still reaches the target instead of being killed.
@@ -283,6 +477,31 @@ func (t *Traffic) initIndex() error {
 	if _, err := conn.ExecContext(ctx, indexSchema); err != nil {
 		return err
 	}
+	// Attribution columns added after the first release: CREATE TABLE IF NOT EXISTS
+	// never alters an existing table, so an install created before them would keep
+	// the old shape and every INSERT (which now lists them) would fail — the same
+	// reason the SOCKS5 ledger migrates its egress/identity columns here.
+	for _, col := range []struct{ name, decl string }{
+		{"task_id", `INTEGER NOT NULL DEFAULT 0`},
+		{"identity", `TEXT NOT NULL DEFAULT ''`},
+		{"egress", `TEXT NOT NULL DEFAULT ''`},
+	} {
+		if err := addColumnIfMissing(ctx, conn, "exchanges", col.name, col.decl); err != nil {
+			return err
+		}
+	}
+	// The attribution index is created here, not in indexSchema: on an existing
+	// database that statement would run before the ALTER above and fail on the
+	// missing column, taking the whole index (and capture) down with it.
+	if _, err := conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_ex_task ON exchanges(task_id)`); err != nil {
+		return err
+	}
+	// The SOCKS5 ledger is independent of the full-text index, so it is applied
+	// before the FTS attempt: a driver build without FTS5 must still record
+	// raw-TCP connections.
+	if err := t.initSocks5Schema(conn); err != nil {
+		return err
+	}
 	if _, err := conn.ExecContext(ctx, ftsSchema); err != nil {
 		log.Printf("[traffic] 全文索引不可用，正文搜索将被禁用（元数据搜索不受影响）：%v", err)
 		return nil
@@ -300,31 +519,312 @@ func hostOnly(hostport string) string {
 	return hostport
 }
 
-// ProxyAddr returns the address workers should set as HTTP(S)_PROXY. A bare
-// ":port" means "bind all interfaces" (legacy default), so map it to loopback.
-func (t *Traffic) ProxyAddr() string {
+// hostPort is the address clients should dial. A bare ":port" means "bind all
+// interfaces" (legacy default), so it is mapped to loopback: a client on this
+// host cannot portably reach 0.0.0.0, and the recorder is a local egress anyway.
+func (t *Traffic) hostPort() string {
 	if strings.HasPrefix(t.addr, ":") {
-		return "http://127.0.0.1" + t.addr
+		return "127.0.0.1" + t.addr
 	}
-	return "http://" + t.addr
+	return t.addr
 }
 
-// SetUpstreamProxy points every captured request at a global egress proxy
+// ProxyAddr returns the URL workers set as HTTP(S)_PROXY.
+func (t *Traffic) ProxyAddr() string { return "http://" + t.hostPort() }
+
+// SocksAddr returns the same listener's SOCKS5 URL. The ingress shares the port
+// (see traffic/socks5.go), so this differs from ProxyAddr only in scheme — and
+// it is socks5h rather than socks5 on purpose: the point of routing through the
+// egress is to have the far side resolve target names, since a client-side
+// lookup would both leak DNS and fail for internal-only names.
+func (t *Traffic) SocksAddr() string { return "socks5h://" + t.hostPort() }
+
+// SetUpstreamProxy points every captured request at a default egress proxy
 // (http/https/socks5, optional user:pass in the URL). An empty raw string clears
 // it, restoring direct dialing. The change is atomic and takes effect on the next
 // connection — no restart, no proxy rebuild. go-mitmproxy dials all three schemes
 // itself, so socks5 works uniformly here regardless of the target tool.
+//
+// Setting a URL proxy replaces any default egress dialer. An identity bound with
+// SetIdentityEgress still overrides both, for its own connections only.
 func (t *Traffic) SetUpstreamProxy(raw string) error {
 	if strings.TrimSpace(raw) == "" {
-		t.upstream.Store(nil)
+		t.applyEgress(nil)
 		return nil
 	}
 	u, err := ValidateProxyURL(raw)
 	if err != nil {
 		return err
 	}
-	t.upstream.Store(u)
+	t.applyEgress(&egress{url: u, label: redactProxyURL(u)})
 	return nil
+}
+
+// SetUpstreamDialer makes an egress dialer (a task's in-process tunnel, say) the
+// DEFAULT outbound path, replacing any URL proxy. A nil dialer clears it, restoring
+// direct dialing. Like SetUpstreamProxy the swap is atomic and applies to the next
+// connection.
+func (t *Traffic) SetUpstreamDialer(d Dialer) {
+	if d == nil {
+		t.applyEgress(nil)
+		return
+	}
+	t.applyEgress(&egress{dialer: d, label: d.Describe()})
+	t.syncUpstreamKeepAlive()
+}
+
+// SetIdentity registers or refreshes an identity's credentials and task, leaving any
+// egress bound to it alone. This is what a task registration uses: agents are rebuilt
+// (and so re-registered) far more often than a tunnel is bound, and a rebuild must not
+// silently unbind the task's tunnel.
+func (t *Traffic) SetIdentity(identity, token string, taskID int64) {
+	if strings.TrimSpace(identity) == "" {
+		return
+	}
+	existing := t.identityEgressFor(identity)
+	ie := &identityEgress{token: token, taskID: taskID}
+	if existing != nil {
+		ie.egress = existing.egress
+	}
+	if _, loaded := t.identities.Swap(identity, ie); !loaded {
+		t.identityCount.Add(1)
+	}
+}
+
+// SetIdentityEgress registers an identity authenticated by token, bound to taskID,
+// and optionally gives it its own egress d. Connections whose client presented that
+// credential leave through d; everything else — the default egress, and every other
+// identity — is unaffected, which is what makes a tunnel a per-task decision rather
+// than a platform-wide one.
+//
+// A nil d is meaningful and is not the same as ClearIdentityEgress: the identity is
+// still known and authenticated, and its traffic is still attributed to taskID, but
+// it uses the default egress. Registering every task this way keeps the ledger
+// attribution complete while only the tasks that need a tunnel get one.
+//
+// Per-identity egress is dialer-only by design: a URL proxy would have to be applied
+// inside the routing hook, and the CONNECT belongs to dialUpstream.
+func (t *Traffic) SetIdentityEgress(identity, token string, taskID int64, d Dialer) {
+	if strings.TrimSpace(identity) == "" {
+		return
+	}
+	ie := &identityEgress{token: token, taskID: taskID}
+	if d != nil {
+		ie.egress = &egress{dialer: d, label: d.Describe()}
+	}
+	if _, loaded := t.identities.Swap(identity, ie); !loaded {
+		t.identityCount.Add(1)
+	}
+	t.syncDialer()
+	t.syncUpstreamKeepAlive()
+}
+
+// ClearIdentityEgress drops an identity's binding, so its connections fall back to
+// the default egress.
+func (t *Traffic) ClearIdentityEgress(identity string) {
+	if _, loaded := t.identities.LoadAndDelete(identity); loaded {
+		t.identityCount.Add(-1)
+	}
+	t.syncDialer()
+	t.syncUpstreamKeepAlive()
+}
+
+// identityEgressFor returns the binding for an identity, or nil.
+func (t *Traffic) identityEgressFor(identity string) *identityEgress {
+	if identity == "" {
+		return nil
+	}
+	v, ok := t.identities.Load(identity)
+	if !ok {
+		return nil
+	}
+	e, _ := v.(*identityEgress)
+	return e
+}
+
+// identityTaskID is the task an identity belongs to, for ledger attribution.
+func (t *Traffic) identityTaskID(identity string) int64 {
+	if e := t.identityEgressFor(identity); e != nil {
+		return e.taskID
+	}
+	return 0
+}
+
+// authenticate validates a client against the identity registry.
+//
+// A client that presents no credentials keeps the default egress. The platform has
+// its own paths that reach this listener anonymously — the http custom tool's
+// use_recording_proxy builds an in-process Transport with no credentials, and an
+// MCP server is handed the address as a --proxy-server argument — and none of them
+// may break because some task bound a tunnel.
+//
+// Credentials, once presented, must name a known identity: a revoked or mistyped
+// task must not silently fall back to the default egress, which is exactly how
+// traffic ends up leaving through an egress nobody chose for it.
+func (t *Traffic) authenticate(user, pass string) (string, bool) {
+	if t.authOverride != nil {
+		return t.authOverride(user, pass)
+	}
+	if user == "" && pass == "" {
+		return "", true
+	}
+	e := t.identityEgressFor(user)
+	if e == nil || e.token == "" || subtle.ConstantTimeCompare([]byte(e.token), []byte(pass)) != 1 {
+		log.Printf("[traffic] 拒绝无法识别的代理凭据 identity=%q（已绑定的任务出口 %d 个）", user, t.identityLen())
+		return "", false
+	}
+	return user, true
+}
+
+// identityLen counts registered identities, for diagnostics.
+func (t *Traffic) identityLen() int { return int(t.identityCount.Load()) }
+
+// routeDialer is the egress hook the listener consults for every connection while
+// some dialer exists. It resolves the connection's authenticated identity to its own
+// egress and hands connections it does not own back to the default path (upstream
+// proxy URL, or a direct dial) via ErrEgressNotHandled.
+func (t *Traffic) routeDialer(ctx context.Context, req *http.Request, network, address string) (net.Conn, error) {
+	identity := mproxy.IdentityFromContext(ctx)
+	if e := t.identityEgressFor(identity); e != nil && e.egress != nil {
+		log.Printf("[traffic] 出口路由 %s -> 身份 %q 的隧道", address, identity)
+		return e.egress.dialer.Dial(ctx, address)
+	}
+	if g := t.egress.Load(); g != nil && g.dialer != nil {
+		log.Printf("[traffic] 出口路由 %s -> 身份 %q 无隧道，用默认拨号器", address, identity)
+		return g.dialer.Dial(ctx, address)
+	}
+	log.Printf("[traffic] 出口路由 %s -> 身份 %q 无隧道，交回默认路径（URL 代理或直连）", address, identity)
+	return nil, mproxy.ErrEgressNotHandled
+}
+
+// egressLabelFor names the egress for one connection: the identity's own binding
+// when it has one, otherwise the default. It always answers, so the ledger never
+// falls back to naming the router itself.
+func (t *Traffic) egressLabelFor(ctx context.Context, req *http.Request) string {
+	if e := t.identityEgressFor(mproxy.IdentityFromContext(ctx)); e != nil && e.egress != nil {
+		return e.egress.label
+	}
+	return t.EgressLabel()
+}
+
+// syncDialer installs the routing hook exactly while some dialer exists and clears
+// it otherwise: go-mitmproxy treats a non-nil dialer hook as "the dialer owns the
+// egress", so installing it speculatively would take the URL upstream off its
+// original mechanism for installs that never bind a tunnel.
+// tunnelEgress marks a slot-limited egress (a tunnel with very few concurrent
+// connections). Structural, so traffic need not import the tunnel package.
+type tunnelEgress interface{ TunnelEgress() bool }
+
+// syncUpstreamKeepAlive stops the listener's transports from pooling upstream
+// connections while ANY egress it may use is slot-limited. An idle pooled
+// connection keeps holding a tunnel slot until the peer times it out, which is
+// how a tunnel ends up refusing every new connection after a few requests.
+// Conservative by design: disabling reuse on a listener that also serves direct
+// traffic costs a little efficiency, never correctness.
+func (t *Traffic) syncUpstreamKeepAlive() {
+	if t.proxy == nil || t.proxy.Opts == nil {
+		return
+	}
+	t.proxy.Opts.DisableUpstreamKeepAlive.Store(t.hasTunnelEgress())
+}
+
+func (t *Traffic) hasTunnelEgress() bool {
+	isTunnel := func(e *egress) bool {
+		if e == nil || e.dialer == nil {
+			return false
+		}
+		te, ok := e.dialer.(tunnelEgress)
+		return ok && te.TunnelEgress()
+	}
+	if isTunnel(t.egress.Load()) {
+		return true
+	}
+	found := false
+	t.identities.Range(func(_, v any) bool {
+		if ie, ok := v.(*identityEgress); ok && isTunnel(ie.egress) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func (t *Traffic) syncDialer() {
+	if t.proxy == nil {
+		return
+	}
+	if !t.anyDialer() {
+		t.proxy.SetUpstreamDialer(nil, "")
+		return
+	}
+	// An empty label on purpose: the router is not an egress, so nothing may be
+	// labelled after it. EgressLabel names each connection instead.
+	t.proxy.SetUpstreamDialer(t.routeDialer, "")
+}
+
+// anyDialer reports whether any dialer egress is bound, as the default or to an
+// identity. Identities registered without one do not need the routing hook.
+func (t *Traffic) anyDialer() bool {
+	if e := t.egress.Load(); e != nil && e.dialer != nil {
+		return true
+	}
+	found := false
+	t.identities.Range(func(_, v any) bool {
+		if ie, ok := v.(*identityEgress); ok && ie.egress != nil && ie.egress.dialer != nil {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// applyEgress swaps the default outbound path and re-syncs the dialer hook.
+func (t *Traffic) applyEgress(e *egress) {
+	t.egress.Store(e)
+	t.syncDialer()
+	t.syncUpstreamKeepAlive()
+}
+
+// upstreamURL is the URL form of the current egress: nil when it is a dialer (the
+// dialer hook owns the egress then) or when nothing is configured, which makes
+// go-mitmproxy dial the target directly.
+func (t *Traffic) upstreamURL() *url.URL {
+	if e := t.egress.Load(); e != nil {
+		return e.url
+	}
+	return nil
+}
+
+// IdentityEgressLabel names the egress bound to one identity, "" when it has none
+// (its traffic uses the default egress). The API and the ledger both need to answer
+// "where does this task's traffic actually go".
+func (t *Traffic) IdentityEgressLabel(identity string) string {
+	if e := t.identityEgressFor(identity); e != nil && e.egress != nil {
+		return e.egress.label
+	}
+	return ""
+}
+
+// EgressLabel names the current outbound path for logs and the API: "" for a
+// direct dial, the redacted proxy URL, or the dialer's own description.
+func (t *Traffic) EgressLabel() string {
+	if e := t.egress.Load(); e != nil {
+		return e.label
+	}
+	return ""
+}
+
+// redactProxyURL renders a proxy URL without its userinfo: labels reach logs and
+// the ledger, where credentials must never appear.
+func redactProxyURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	c := *u
+	c.User = nil
+	return c.String()
 }
 
 // ValidateProxyURL parses and checks a proxy URL (http/https/socks5, optional
@@ -367,6 +867,8 @@ func (t *Traffic) Close() error {
 	if t.closed != nil {
 		t.closeOnce.Do(func() { close(t.closed) })
 	}
+	// Drain accepted exchanges before the DB handle goes away.
+	t.stopRecords()
 	t.reaping.Wait()
 	return t.db.Close()
 }
@@ -393,7 +895,7 @@ func (s *sink) Response(f *mproxy.Flow) {
 	if f.Request == nil || f.Response == nil {
 		return
 	}
-	s.t.record(f)
+	s.t.enqueue(f)
 }
 
 // RequestError fires when a request through an established MITM tunnel fails. If
@@ -430,57 +932,159 @@ func proxyCausedErr(err error) bool {
 	return false
 }
 
+// pendingExchange is one completed exchange, snapshotted off the flow. The proxy
+// reuses Flow objects once an addon returns, so every field recording needs — the
+// header text and the body bytes included — is copied while it is still valid.
+type pendingExchange struct {
+	id, host, method, tmpl, url string
+	reqHead, respHead           string
+	reqCT, contentType          string
+	identity, egress            string
+	ts                          int64
+	status, reqLen, respLen     int
+	taskID                      int64
+	reqBody, respBody           []byte
+	// done is set only on a FlushRecords barrier; the writer closes it instead of
+	// persisting anything.
+	done chan struct{}
+}
+
+// enqueue hands a completed exchange to the writer. It runs on the response path,
+// so it only snapshots. Everything that touches SQLite or the blob store happens in
+// recordLoop: doing it here serialised every concurrent response behind one write
+// lock (measured: 100 parallel requests, p50 ~2.4s against 3.5ms direct).
+func (t *Traffic) enqueue(f *mproxy.Flow) {
+	if f == nil || f.Request == nil || f.Response == nil || f.Request.URL == nil {
+		return
+	}
+	identity := ""
+	if f.ConnContext != nil {
+		identity = f.ConnContext.Identity
+	}
+	// Where this exchange actually left: the identity own egress (a task tunnel) when
+	// it has one, otherwise the listener-level upstream (global_proxy). Same rule as
+	// the raw-TCP ledger, so proxied-or-direct is answerable per row, not per listener.
+	egress := t.IdentityEgressLabel(identity)
+	if egress == "" {
+		egress = t.EgressLabel()
+	}
+	n := t.seq.Add(1)
+	now := time.Now()
+	pe := pendingExchange{
+		id:          fmt.Sprintf("%d-%04d", now.Unix(), n%10000),
+		ts:          now.Unix(),
+		host:        f.Request.URL.Hostname(),
+		method:      f.Request.Method,
+		tmpl:        db.TemplatePath(f.Request.URL.EscapedPath()),
+		url:         f.Request.URL.String(),
+		reqHead:     fmt.Sprintf("%s %s %s\n%s", f.Request.Method, f.Request.URL.RequestURI(), f.Request.Proto, requestHeaderLines(f.Request)),
+		respHead:    fmt.Sprintf("HTTP %d\n%s", f.Response.StatusCode, headerLines(f.Response.Header)),
+		reqCT:       f.Request.Header.Get("Content-Type"),
+		contentType: f.Response.Header.Get("Content-Type"),
+		status:      f.Response.StatusCode,
+		reqLen:      len(f.Request.Body),
+		respLen:     len(f.Response.Body),
+		identity:    identity,
+		taskID:      t.identityTaskID(identity),
+		egress:      egress,
+		reqBody:     append([]byte(nil), f.Request.Body...),
+		respBody:    append([]byte(nil), f.Response.Body...),
+	}
+	if t.recCh == nil {
+		// Zero-value Traffic (tests): no writer goroutine, record inline.
+		t.record(pe)
+		return
+	}
+	t.recMu.RLock()
+	defer t.recMu.RUnlock()
+	if t.recShut {
+		return
+	}
+	t.recCh <- pe
+}
+
+// recordLoop is the single writer: one exchange at a time, in arrival order.
+func (t *Traffic) recordLoop() {
+	defer close(t.recDone)
+	for pe := range t.recCh {
+		if pe.done != nil {
+			close(pe.done) // a FlushRecords barrier: nothing to persist
+			continue
+		}
+		t.record(pe)
+	}
+}
+
+// stopRecords drains the queue, so shutdown never drops an accepted exchange.
+func (t *Traffic) stopRecords() {
+	if t.recCh == nil || t.recDone == nil {
+		return
+	}
+	t.recMu.Lock()
+	if !t.recShut {
+		t.recShut = true
+		close(t.recCh)
+	}
+	t.recMu.Unlock()
+	<-t.recDone
+}
+
+// FlushRecords blocks until everything enqueued so far is persisted. Recording is
+// asynchronous, so a caller that must observe a record immediately uses this.
+func (t *Traffic) FlushRecords() {
+	if t.recCh == nil || t.recDone == nil {
+		return
+	}
+	done := make(chan struct{})
+	t.recMu.RLock()
+	if t.recShut {
+		t.recMu.RUnlock()
+		return
+	}
+	t.recCh <- pendingExchange{done: done}
+	t.recMu.RUnlock()
+	<-done
+}
+
 // record persists one exchange entirely in SQLite: metadata, bodies and the
 // full-text index. Nothing is written to a per-request directory — only bodies
 // above maxInlineBody spill to the content-addressed blob store.
-func (t *Traffic) record(f *mproxy.Flow) {
+func (t *Traffic) record(pe pendingExchange) {
 	// The write lock covers blob + index writes, so DeleteHost (and its blob GC)
 	// can run under the same lock without racing a concurrent record.
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
-	host := f.Request.URL.Hostname()
-	method := f.Request.Method
-	tmpl := db.TemplatePath(f.Request.URL.EscapedPath())
-	n := t.seq.Add(1)
-	now := time.Now()
-	id := fmt.Sprintf("%d-%04d", now.Unix(), n%10000)
 
-	ct := f.Response.Header.Get("Content-Type")
-	url := f.Request.URL.String()
-	reqHead := fmt.Sprintf("%s %s %s\n%s", method, f.Request.URL.RequestURI(), f.Request.Proto, requestHeaderLines(f.Request))
-	respHead := fmt.Sprintf("HTTP %d\n%s", f.Response.StatusCode, headerLines(f.Response.Header))
 	// Bodies are spilled before the transaction opens: blob writes are filesystem
 	// work and must not sit inside the SQLite write lock.
-	reqB := t.spill(f.Request.Body, f.Request.Header.Get("Content-Type"))
-	respB := t.spill(f.Response.Body, ct)
+	reqB := t.spill(pe.reqBody, pe.reqCT)
+	respB := t.spill(pe.respBody, pe.contentType)
 
 	tx, err := t.db.Begin()
 	if err != nil {
-		log.Printf("[traffic] 记录 %s 失败（开启事务）：%v", url, err)
+		log.Printf("[traffic] 记录 %s 失败（开启事务）：%v", pe.url, err)
 		return
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
 
-	// path stays empty for db-resident exchanges; a non-empty path marks a legacy
-	// row whose bodies still live in the old on-disk tree (see Get).
-	res, err := tx.Exec(`INSERT OR REPLACE INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path)
-VALUES(?,?,?,?,?,?,?,?,?,?,'')`,
-		id, now.Unix(), host, method, tmpl, url, f.Response.StatusCode, ct,
-		len(f.Request.Body), len(f.Response.Body))
+	res, err := tx.Exec(`INSERT OR REPLACE INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path,task_id,identity,egress)
+VALUES(?,?,?,?,?,?,?,?,?,?,'',?,?,?)`,
+		pe.id, pe.ts, pe.host, pe.method, pe.tmpl, pe.url, pe.status, pe.contentType,
+		pe.reqLen, pe.respLen, pe.taskID, pe.identity, pe.egress)
 	if err != nil {
-		log.Printf("[traffic] 记录 %s 失败（写索引）：%v", url, err)
+		log.Printf("[traffic] 记录 %s 失败（写索引）：%v", pe.url, err)
 		return
 	}
 	rowid, err := res.LastInsertId()
 	if err != nil {
-		log.Printf("[traffic] 记录 %s 失败（取 rowid）：%v", url, err)
+		log.Printf("[traffic] 记录 %s 失败（取 rowid）：%v", pe.url, err)
 		return
 	}
 
 	if _, err := tx.Exec(`INSERT OR REPLACE INTO exchange_bodies(id,req_head,req_body,req_blob,resp_head,resp_body,resp_blob)
 VALUES(?,?,?,?,?,?,?)`,
-		id, reqHead, reqB.inline, nullIfEmpty(reqB.hash), respHead, respB.inline, nullIfEmpty(respB.hash)); err != nil {
-		log.Printf("[traffic] 记录 %s 失败（写正文）：%v", url, err)
+		pe.id, pe.reqHead, reqB.inline, nullIfEmpty(reqB.hash), pe.respHead, respB.inline, nullIfEmpty(respB.hash)); err != nil {
+		log.Printf("[traffic] 记录 %s 失败（写正文）：%v", pe.url, err)
 		return
 	}
 
@@ -488,8 +1092,8 @@ VALUES(?,?,?,?,?,?,?)`,
 		if h == "" {
 			continue
 		}
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO blob_refs(hash,exchange_id) VALUES(?,?)`, h, id); err != nil {
-			log.Printf("[traffic] 记录 %s 失败（登记 blob 引用）：%v", url, err)
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO blob_refs(hash,exchange_id) VALUES(?,?)`, h, pe.id); err != nil {
+			log.Printf("[traffic] 记录 %s 失败（登记 blob 引用）：%v", pe.url, err)
 			return
 		}
 	}
@@ -497,15 +1101,15 @@ VALUES(?,?,?,?,?,?,?)`,
 	if t.fts {
 		// The index is fed from memory, so a body that spilled to _blobs is still
 		// fully searchable even though only its preview is stored inline.
-		idx := strings.Join([]string{url, reqHead, reqB.index, respHead, respB.index}, "\n")
+		idx := strings.Join([]string{pe.url, pe.reqHead, reqB.index, pe.respHead, respB.index}, "\n")
 		if _, err := tx.Exec(`INSERT INTO ex_fts(rowid,content) VALUES(?,?)`, rowid, idx); err != nil {
-			log.Printf("[traffic] 记录 %s 失败（写全文索引）：%v", url, err)
+			log.Printf("[traffic] 记录 %s 失败（写全文索引）：%v", pe.url, err)
 			return
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		log.Printf("[traffic] 记录 %s 失败（提交）：%v", url, err)
+		log.Printf("[traffic] 记录 %s 失败（提交）：%v", pe.url, err)
 	}
 }
 
@@ -516,6 +1120,14 @@ type storedBody struct {
 	inline []byte
 	hash   string
 	index  string
+}
+
+// spillUnderWriteLock keeps spill() where it has always run: under wmu, the same
+// lock that serialises recording versus DeleteHost and its blob GC.
+func (t *Traffic) spillUnderWriteLock(body []byte, contentType string) storedBody {
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	return t.spill(body, contentType)
 }
 
 // spill decides where one body lives. Small bodies stay inline. Large ones are
@@ -760,6 +1372,13 @@ type ExchangeMeta struct {
 	ContentType string `json:"content_type"`
 	RespLen     int    `json:"resp_len"`
 	Path        string `json:"path"`
+	// TaskID/Identity/Egress say which task this exchange belongs to and which
+	// egress the connection left through ("" = the default egress / direct for an
+	// anonymous connection). They are what makes a tunnelled internal request
+	// distinguishable from a direct one in the traffic view.
+	TaskID   int64  `json:"task_id"`
+	Identity string `json:"identity"`
+	Egress   string `json:"egress"`
 }
 
 // Search returns paged exchange metadata (never bodies).
@@ -767,7 +1386,7 @@ func (t *Traffic) Search(host string, page, size int) ([]ExchangeMeta, error) {
 	if size <= 0 || size > 500 {
 		size = 100
 	}
-	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges`
+	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path,task_id,identity,egress FROM exchanges`
 	args := []any{}
 	if host != "" {
 		q += ` WHERE host=?`
@@ -783,7 +1402,7 @@ func (t *Traffic) Search(host string, page, size int) ([]ExchangeMeta, error) {
 	var out []ExchangeMeta
 	for rows.Next() {
 		var m ExchangeMeta
-		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path); err != nil {
+		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path, &m.TaskID, &m.Identity, &m.Egress); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -821,10 +1440,23 @@ type PageQuery struct {
 	Body    string // content box: captured request/response text only (full-text)
 	Path    string // url_template substring — the vulnerability's path
 	Status  string // exact code ("404") or class bucket ("4xx")
-	RespMin int64  // minimum resp_len, or -1 when unset
-	RespMax int64  // maximum resp_len, or -1 when unset
-	Sort    string // ts | status | resp_len (default ts)
-	Order   string // asc | desc (default desc)
+	RespMin *int64 // minimum resp_len; nil = unset（0 是合法下界，不能用零值当"未设置"）
+	RespMax *int64 // maximum resp_len; nil = unset
+	// RespMin/RespMax 是指针：nil=不筛。曾经用 >=0 表示"已设置"，于是零值 PageQuery
+	// 变成 resp_len==0（几乎匹配不到任何行）——这个坑踩过两次，改成指针后不复存在。
+	Sort  string // ts | status | resp_len (default ts)
+	Order string // asc | desc (default desc)
+	// Attributed-egress filters for the traffic page drill-down. Zero values mean no
+	// filter at all.
+	TaskID int64 // exact task id
+	// Unattributed 只看"没有任务归属"的行（task_id=0）：平台自身 / 没有任务上下文的流量。
+	// 不能用 TaskID=0 表达这个意思——零值在那里等于"没填筛选"。
+	Unattributed bool
+	// TCPWithBody 只看"保存了正文的裸 TCP"（识别出的数据库协议）。它只在合并视图里有意义：
+	// 交换表的正文是 HTTP 报文，不属于这个筛选。
+	TCPWithBody bool
+	Identity    string // exact identity
+	Egress      string // egress substring, e.g. socks5 or regeorg
 }
 
 // sortColumns whitelists the columns Page may order by, so the caller-supplied
@@ -877,6 +1509,23 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	if h := strings.TrimSpace(f.Host); h != "" {
 		add("host LIKE ?", "%"+h+"%")
 	}
+	if f.TaskID > 0 {
+		add("task_id=?", f.TaskID)
+	}
+	if f.Unattributed {
+		add("task_id=0")
+	}
+	if id := strings.TrimSpace(f.Identity); id != "" {
+		add("identity=?", id)
+	}
+	switch e := strings.TrimSpace(f.Egress); {
+	case e == "" || strings.EqualFold(e, "all"):
+	case strings.EqualFold(e, "direct"):
+		// 直连：出口标签为空。
+		add("(egress='' OR egress IS NULL)")
+	default:
+		add("egress=?", e)
+	}
 	if m := strings.TrimSpace(f.Method); m != "" {
 		add("method=?", strings.ToUpper(m))
 	}
@@ -886,11 +1535,11 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	if cond, sargs, ok := statusFilter(f.Status); ok {
 		add(cond, sargs...)
 	}
-	if f.RespMin >= 0 {
-		add("resp_len>=?", f.RespMin)
+	if f.RespMin != nil {
+		add("resp_len>=?", *f.RespMin)
 	}
-	if f.RespMax >= 0 {
-		add("resp_len<=?", f.RespMax)
+	if f.RespMax != nil {
+		add("resp_len<=?", *f.RespMax)
 	}
 	if s := strings.TrimSpace(f.Query); s != "" {
 		like := "%" + s + "%"
@@ -925,7 +1574,7 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	}
 	// id embeds capture timestamp + sequence, so a trailing id DESC makes the order
 	// total and pagination stable even when the sort column has many ties.
-	sel := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges` +
+	sel := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path,task_id,identity,egress FROM exchanges` +
 		where + ` ORDER BY ` + col + ` ` + dir + `, id DESC LIMIT ? OFFSET ?`
 	qargs := append(append([]any{}, args...), size, page*size)
 	rs, err := t.db.Query(sel, qargs...)
@@ -935,7 +1584,7 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	defer rs.Close()
 	for rs.Next() {
 		var m ExchangeMeta
-		if err := rs.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path); err != nil {
+		if err := rs.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path, &m.TaskID, &m.Identity, &m.Egress); err != nil {
 			return nil, 0, err
 		}
 		rows = append(rows, m)
@@ -997,7 +1646,7 @@ type HostCount struct {
 // Hosts returns distinct recorded hosts with exchange counts, most recent
 // activity first — powers the page's target picker.
 func (t *Traffic) Hosts() ([]HostCount, error) {
-	rows, err := t.db.Query(`SELECT host, COUNT(*) AS n, MAX(ts) AS last FROM exchanges GROUP BY host ORDER BY last DESC`)
+	rows, err := t.db.Query(`SELECT host, COUNT(*) AS n, MAX(ts) AS last FROM (SELECT host, ts FROM exchanges UNION ALL SELECT dst_host AS host, ts FROM socks5_connections) GROUP BY host ORDER BY last DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1042,7 +1691,7 @@ func (t *Traffic) DeleteHost(host string) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
-	n, err := t.deleteWhere(tx, `host LIKE ?`, like)
+	n, err := t.deleteWhereBoth(tx, `host LIKE ?`, `dst_host LIKE ?`, like)
 	if err != nil {
 		return 0, err
 	}
@@ -1093,7 +1742,7 @@ func (t *Traffic) DeleteAll() (deleted int64, reclaimed int64, err error) {
 		return 0, 0, err
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
-	if deleted, err = t.deleteWhere(tx, `1=1`); err != nil {
+	if deleted, err = t.deleteWhereBoth(tx, `1=1`, `1=1`); err != nil {
 		return 0, 0, err
 	}
 	// Staged before the commit so a filesystem failure can still abort the whole
@@ -1179,6 +1828,28 @@ func (t *Traffic) compactIndex() error {
 // deleteWhere removes every trace of the exchanges matching the condition:
 // full-text index rows, bodies, blob references, and finally the index rows.
 // Order matters — each sub-select reads exchanges, so that table is emptied last.
+// deleteWhereBoth 同时清理两份流量：HTTP 交换（exchanges 系）与裸 TCP 账本（socks5 系）。
+//
+// 之前所有删除路径（按主机、按主机批量、清空全部）只走 deleteWhere，而它只动 exchanges/
+// exchange_bodies/blob_refs/ex_fts —— socks5_connections 与 socks5_bodies 从来没被删过，
+// 所以"删了流量"以后裸 TCP 行和它们保存的上下行头部还在（合并成一张表后一眼就能看到）。
+// socksWhere 是同一批条件在 socks5_connections 上的写法（列名是 dst_host），参数复用。
+func (t *Traffic) deleteWhereBoth(tx *sql.Tx, exWhere, socksWhere string, args ...any) (int64, error) {
+	socksDeleted := int64(0)
+	if socksWhere != "" {
+		if _, err := tx.Exec(`DELETE FROM socks5_bodies WHERE conn_id IN (SELECT id FROM socks5_connections WHERE `+socksWhere+`)`, args...); err != nil {
+			return 0, fmt.Errorf("删除裸 TCP 正文: %w", err)
+		}
+		res, err := tx.Exec(`DELETE FROM socks5_connections WHERE `+socksWhere, args...)
+		if err != nil {
+			return 0, fmt.Errorf("删除裸 TCP 账本: %w", err)
+		}
+		// 删除条数要把裸 TCP 算进去：否则"清空全部流量"删掉两百多条却报 0，看起来像没删。
+		socksDeleted, _ = res.RowsAffected()
+	}
+	n, err := t.deleteWhere(tx, exWhere, args...)
+	return n + socksDeleted, err
+}
 func (t *Traffic) deleteWhere(tx *sql.Tx, where string, args ...any) (int64, error) {
 	if t.fts {
 		// ex_fts is contentless and addressed by rowid, hence the rowid sub-select.
@@ -1408,7 +2079,7 @@ func (s *HostDeleteStage) Deleted() int64 {
 // StageDeleteHostsExact prepares a reversible exact-host deletion. Callers must
 // finish every successful stage with Commit or Rollback.
 func (t *Traffic) StageDeleteHostsExact(hosts []string) (*HostDeleteStage, error) {
-	return t.stageDeleteHostsExact(hosts, 0, 0)
+	return t.stageDeleteHostsExact(hosts, 0, 0, 0)
 }
 
 // StageDeleteHostsExactForArchive ties the reversible traffic deletion to a
@@ -1418,10 +2089,18 @@ func (t *Traffic) StageDeleteHostsExactForArchive(hosts []string, archiveID, tas
 	if archiveID <= 0 || taskID <= 0 {
 		return nil, errors.New("archive and task ids must be positive")
 	}
-	return t.stageDeleteHostsExact(hosts, archiveID, taskID)
+	return t.stageDeleteHostsExact(hosts, archiveID, taskID, 0)
 }
 
-func (t *Traffic) stageDeleteHostsExact(hosts []string, archiveID, taskID int64) (*HostDeleteStage, error) {
+// StageDeleteForTask 按任务删流量（可回滚暂存版）：交换表与裸 TCP 账本都按 task_id 命中，
+// 主机清单作为兜底。删任务走这条，而不是"只按主机清单删"。
+func (t *Traffic) StageDeleteForTask(taskID int64, hosts []string) (*HostDeleteStage, error) {
+	if taskID <= 0 {
+		return nil, errors.New("task id must be positive")
+	}
+	return t.stageDeleteHostsExact(hosts, 0, taskID, taskID)
+}
+func (t *Traffic) stageDeleteHostsExact(hosts []string, archiveID, taskID, matchTask int64) (*HostDeleteStage, error) {
 	t.wmu.Lock()
 	stage := &HostDeleteStage{traffic: t}
 	fail := func(cause error) (*HostDeleteStage, error) {
@@ -1459,12 +2138,33 @@ func (t *Traffic) stageDeleteHostsExact(hosts []string, archiveID, taskID int64)
 		return abort(err)
 	}
 	stage.tx = tx
-	for _, h := range unique {
-		n, err := t.deleteWhere(tx, `host=?`, h)
+	if matchTask > 0 {
+		// 任务维度：task_id 命中，或主机在清单里——两个条件都要。
+		//   只按任务：老数据没有归属（task_id=0）却确实属于这个任务，会漏。
+		//   只按主机：同名主机上别的任务的流量会被误删，主机不在清单里又会漏。
+		exWhere, socksWhere := `task_id=?`, `task_id=?`
+		args := []any{matchTask}
+		if len(unique) > 0 {
+			marks := strings.TrimSuffix(strings.Repeat("?,", len(unique)), ",")
+			exWhere = `(task_id=? OR host IN (` + marks + `))`
+			socksWhere = `(task_id=? OR dst_host IN (` + marks + `))`
+			for _, h := range unique {
+				args = append(args, h)
+			}
+		}
+		n, err := t.deleteWhereBoth(tx, exWhere, socksWhere, args...)
 		if err != nil {
 			return fail(err)
 		}
 		stage.deleted += n
+	} else {
+		for _, h := range unique {
+			n, err := t.deleteWhereBoth(tx, `host=?`, `dst_host=?`, h)
+			if err != nil {
+				return fail(err)
+			}
+			stage.deleted += n
+		}
 	}
 
 	stage.stageDir, stage.moves, err = t.stageTreesForArchive(legacy, unique, archiveID, taskID)
@@ -1598,7 +2298,7 @@ func (t *Traffic) deleteArchivedHosts(hosts []string) error {
 	}
 	defer tx.Rollback() //nolint:errcheck
 	for _, host := range hosts {
-		if _, err := t.deleteWhere(tx, `host=?`, host); err != nil {
+		if _, err := t.deleteWhereBoth(tx, `host=?`, `dst_host=?`, host); err != nil {
 			return err
 		}
 	}
@@ -1894,7 +2594,35 @@ func (t *Traffic) legacyBlobRefs(refs map[string]struct{}) error {
 // query returns one page of exchange metadata filtered by host and/or a url
 // substring. Default page size is intentionally small (3) to keep tool results
 // lightweight and capped at 10; page is 0-based (page*limit offset).
+// defaultTaskScopeFromAgentID resolves the calling agent to a task id when the
+// agent id carries one ("task12", "task12-reporter"). 0 means "no scope", which
+// leaves the search global — the caller then relies on the returned task_id.
+func defaultTaskScopeFromAgentID(agentID string) int64 {
+	s := strings.TrimSpace(agentID)
+	if !strings.HasPrefix(s, "task") {
+		return 0
+	}
+	s = strings.TrimPrefix(s, "task")
+	end := 0
+	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0
+	}
+	n, err := strconv.ParseInt(s[:end], 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// query is the unscoped form used by tests and callers that need no task scope.
 func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([]ExchangeMeta, error) {
+	return t.queryScoped(host, contains, bodyContains, 0, page, limit)
+}
+
+func (t *Traffic) queryScoped(host, contains, bodyContains string, taskID int64, page, limit int) ([]ExchangeMeta, error) {
 	if limit <= 0 {
 		limit = 3
 	}
@@ -1904,8 +2632,12 @@ func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([
 	if page < 0 {
 		page = 0
 	}
-	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges WHERE 1=1`
+	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path,task_id,identity,egress FROM exchanges WHERE 1=1`
 	args := []any{}
+	if taskID > 0 {
+		q += ` AND task_id=?`
+		args = append(args, taskID)
+	}
 	if host != "" {
 		hostName, port, err := normalizeSearchHost(host)
 		if err != nil {
@@ -1951,7 +2683,7 @@ func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([
 	var out []ExchangeMeta
 	for rows.Next() {
 		var m ExchangeMeta
-		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path); err != nil {
+		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path, &m.TaskID, &m.Identity, &m.Egress); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -2009,28 +2741,35 @@ func (t *Traffic) Tools() []actool.CoreTool {
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"host":          map[string]any{"type": "string", "description": "按主机过滤（必填；如 '107.172.96.177'、'107.172.96.177:8082' 或 'http://107.172.96.177:8082/path'）"},
+				"host":          map[string]any{"type": "string", "description": "按主机过滤（可选；如 '107.172.96.177'、'107.172.96.177:8082' 或 'http://107.172.96.177:8082/path'）。与 body_contains 至少给一个"},
 				"contains":      map[string]any{"type": "string", "description": "URL 子串过滤（可选，如 'api' / 'login'）"},
-				"body_contains": map[string]any{"type": "string", "description": "正文全文搜索（可选，至少 3 个字符），匹配请求/响应的头与正文，如 'password' / 'root:x:0' / '内网测试'"},
+				"body_contains": map[string]any{"type": "string", "description": "正文全文搜索（至少 3 个字符），匹配请求/响应的头与正文，如 'password' / 'root:x:0' / 'i-8vbid9vyu04zpjux8xkk'。证据常常在**代理端点**（RCE/上传接口）的响应体里，此时用证据里的关键串搜它，而不是搜证据所属的主机"},
+				"task_id":       map[string]any{"type": "integer", "description": "只看某个任务的流量（可选；默认按调用者所属任务限定，避免多任务同主机串包）"},
 				"limit":         map[string]any{"type": "integer", "description": "每页条数，默认 3，最大 10"},
 				"page":          map[string]any{"type": "integer", "description": "页码，从 0 开始，默认 0（按 ts 倒序分页）"},
 			},
-			"required": []any{"host"},
 		},
 		ReadOnly:    ro,
 		Permissions: allow,
-		Run: func(_ context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
+		Run: func(_ context.Context, in json.RawMessage, tc *actool.ToolContext) (actool.Result, error) {
 			var a struct {
 				Host, Contains string
 				BodyContains   string `json:"body_contains"`
+				TaskID         int64  `json:"task_id"`
 				Limit          int
 				Page           int
 			}
 			_ = json.Unmarshal(in, &a)
-			if strings.TrimSpace(a.Host) == "" {
-				return actool.Errorf("host 为必填参数：请指定裸主机、主机:端口或完整 URL，避免全库扫描。"), nil
+			if strings.TrimSpace(a.Host) == "" && len([]rune(strings.TrimSpace(a.BodyContains))) < minTrigram {
+				return actool.Errorf("host 与 body_contains 至少要给一个（正文关键词至少 3 个字符）：按主机查，或用证据里的关键串反查承载它的那条交换。"), nil
 			}
-			rows, err := t.query(a.Host, a.Contains, a.BodyContains, a.Page, a.Limit)
+			scope := a.TaskID
+			if scope == 0 && tc != nil {
+				// Default to the caller's own task: several tasks can hit the same
+				// host, and an unscoped answer mixes their captures together.
+				scope = defaultTaskScopeFromAgentID(tc.AgentID)
+			}
+			rows, err := t.queryScoped(a.Host, a.Contains, a.BodyContains, scope, a.Page, a.Limit)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
@@ -2039,15 +2778,19 @@ func (t *Traffic) Tools() []actool.CoreTool {
 			}
 			// 精简为最小索引：仅保留定位所需字段 + 响应码/长度，不带任何响应内容。
 			type liteRow struct {
-				ID      string `json:"id"`
-				Method  string `json:"method"`
-				URL     string `json:"url"`
-				Status  int    `json:"status"`
-				RespLen int    `json:"resp_len"`
+				ID       string `json:"id"`
+				Method   string `json:"method"`
+				URL      string `json:"url"`
+				Status   int    `json:"status"`
+				RespLen  int    `json:"resp_len"`
+				TaskID   int64  `json:"task_id"`
+				Identity string `json:"identity,omitempty"`
+				Egress   string `json:"egress,omitempty"`
 			}
 			lite := make([]liteRow, 0, len(rows))
 			for _, r := range rows {
-				lite = append(lite, liteRow{ID: r.ID, Method: r.Method, URL: r.URL, Status: r.Status, RespLen: r.RespLen})
+				lite = append(lite, liteRow{ID: r.ID, Method: r.Method, URL: r.URL, Status: r.Status, RespLen: r.RespLen,
+					TaskID: r.TaskID, Identity: r.Identity, Egress: r.Egress})
 			}
 			b, _ := json.Marshal(lite)
 			return actool.Text(string(b)), nil

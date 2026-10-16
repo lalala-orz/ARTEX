@@ -1,6 +1,11 @@
 package traffic
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"net"
+	"testing"
+)
 
 func TestValidateProxyURL(t *testing.T) {
 	ok := []string{
@@ -28,14 +33,14 @@ func TestValidateProxyURL(t *testing.T) {
 }
 
 func TestSetUpstreamProxyStoreClear(t *testing.T) {
-	tr := &Traffic{}
-	if got := tr.upstream.Load(); got != nil {
+	tr := &Traffic{dir: t.TempDir()}
+	if got := tr.upstreamURL(); got != nil {
 		t.Fatalf("initial upstream = %v, want nil", got)
 	}
 	if err := tr.SetUpstreamProxy("socks5://user:pass@10.0.0.1:1080"); err != nil {
 		t.Fatalf("SetUpstreamProxy: %v", err)
 	}
-	u := tr.upstream.Load()
+	u := tr.upstreamURL()
 	if u == nil || u.Scheme != "socks5" || u.Host != "10.0.0.1:1080" {
 		t.Fatalf("stored upstream = %v, want socks5://10.0.0.1:1080", u)
 	}
@@ -46,15 +51,47 @@ func TestSetUpstreamProxyStoreClear(t *testing.T) {
 	if err := tr.SetUpstreamProxy("  "); err != nil {
 		t.Fatalf("SetUpstreamProxy(clear): %v", err)
 	}
-	if got := tr.upstream.Load(); got != nil {
+	if got := tr.upstreamURL(); got != nil {
 		t.Fatalf("after clear upstream = %v, want nil", got)
 	}
 	// Invalid value is rejected and does not mutate current state.
 	if err := tr.SetUpstreamProxy("nope://x"); err == nil {
 		t.Fatal("SetUpstreamProxy(invalid) expected error")
 	}
-	if got := tr.upstream.Load(); got != nil {
+	if got := tr.upstreamURL(); got != nil {
 		t.Fatalf("invalid set mutated upstream to %v, want nil", got)
+	}
+}
+
+// labelDialer is an egress that only names itself.
+type labelDialer struct{ label string }
+
+func (d labelDialer) Describe() string { return d.label }
+
+func (d labelDialer) Dial(context.Context, string) (net.Conn, error) {
+	return nil, errors.New("labelDialer")
+}
+
+// TestEgressIsPerIdentity pins the property the per-task egress design rests on:
+// re-pointing one identity must never move another's. (The design moved from one
+// egress per listener to one per identity; this is that property.)
+func TestEgressIsPerIdentity(t *testing.T) {
+	tr := &Traffic{}
+	tr.SetIdentityEgress("task1", "tok1", 1, labelDialer{label: "tunnel-1"})
+	tr.SetIdentityEgress("task2", "tok2", 2, labelDialer{label: "tunnel-2"})
+	if got := tr.IdentityEgressLabel("task1"); got != "tunnel-1" {
+		t.Errorf("task1 egress = %q，want tunnel-1", got)
+	}
+	if got := tr.IdentityEgressLabel("task2"); got != "tunnel-2" {
+		t.Errorf("task2 egress = %q，want tunnel-2", got)
+	}
+	// Rebinding the first identity to nothing must leave the second alone.
+	tr.SetIdentityEgress("task1", "tok1", 1, nil)
+	if got := tr.IdentityEgressLabel("task1"); got != "" {
+		t.Errorf("after rebinding task1 egress = %q，want empty", got)
+	}
+	if got := tr.IdentityEgressLabel("task2"); got != "tunnel-2" {
+		t.Errorf("task2 egress moved to %q", got)
 	}
 }
 
@@ -72,8 +109,7 @@ func TestProxyAddr(t *testing.T) {
 		{"0.0.0.0:8788", "http://0.0.0.0:8788"},
 	}
 	for _, c := range cases {
-		got := (&Traffic{addr: c.addr}).ProxyAddr()
-		if got != c.want {
+		if got := (&Traffic{addr: c.addr}).ProxyAddr(); got != c.want {
 			t.Errorf("ProxyAddr(%q) = %q, want %q", c.addr, got, c.want)
 		}
 	}

@@ -883,16 +883,57 @@ export interface TrafficExchange {
   status: number;
   content_type: string;
   resp_len: number;
+  /** 归属：任务 id 与出口（空 = 匿名/默认出口） */
+  task_id?: number;
+  identity?: string;
+  egress?: string;
+  kind?: "http" | "raw";
+  raw_id?: number;
+  bytes_up?: number;
+  bytes_down?: number;
+  service?: string;
+  via_upstream?: boolean;
 }
 
 export interface TrafficResp {
   enabled: boolean;
   proxy?: string;
+  // Same listener's SOCKS5 URL. Empty when capture is off (there is no ingress to
+  // point at then — the global egress proxy is used directly instead).
+  socks?: string;
   count?: number; // global total (unfiltered)
   total?: number; // rows matching the current filter (for pagination)
   page?: number;
   size?: number;
   exchanges?: TrafficExchange[];
+}
+
+// One raw-TCP connection relayed through the listener's SOCKS5 ingress: the
+// non-HTTP traffic (databases, agent-authored scripts) that the MITM layer cannot
+// parse. Metadata only — the relayed bytes are never recorded, which is why this
+// is a separate list from the exchange index rather than part of it.
+export interface Socks5Connection {
+  id: number;
+  ts: number;
+  listener_id: string;
+  task_id: number;
+  dst_host: string;
+  dst_port: number;
+  bytes_up: number;
+  bytes_down: number;
+  /** 识别出的数据库服务（mysql/postgres/…；空 = 未识别） */
+  service?: string;
+  mitmed: boolean;
+  via_upstream: boolean;
+}
+
+export interface Socks5Resp {
+  enabled: boolean;
+  socks?: string;
+  total?: number;
+  page?: number;
+  size?: number;
+  connections?: Socks5Connection[];
 }
 
 // Full raw request/response of one exchange (lazy-loaded on row select).

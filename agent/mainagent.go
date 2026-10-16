@@ -21,18 +21,23 @@ type MainAgent struct {
 	findingRecorder FindingRecorder
 	prov            llm.Provider
 	model           string
-	tx              *transcript.Store                      // raw LLM conversation persistence (nil = off)
-	window          int                                    // context window in tokens (for compaction)
-	windowFn        func() int                             // optional dynamic task-chain minimum
-	maxTurns        int                                    // max agent turns per run (0 = unlimited)
-	proxyAddr       string                                 // recording proxy for WebFetch (empty = direct)
-	proxyCACert     string                                 // recording proxy's CA cert path (HTTPS verify)
-	webSearch       WebSearchOpts                          // web_search tool backend selection (off by default)
-	workDir         string                                 // shared work dir (surfaced in prompt as artifact-output target)
-	steerWork       func(intentID int64, msg string) error // engine callback: steer a running work (nil = off)
-	nonStreamingFn  func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
-	noaEnabledFn    func() bool                            // resolver: use experimental noa compaction? (nil = off)
-	maxTokensFn     func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
+	tx              *transcript.Store // raw LLM conversation persistence (nil = off)
+	window          int               // context window in tokens (for compaction)
+	windowFn        func() int        // optional dynamic task-chain minimum
+	maxTurns        int               // max agent turns per run (0 = unlimited)
+	proxyAddr       string            // recording proxy for WebFetch (empty = direct)
+	socksAddr       string            // same listener's SOCKS5 URL for raw-TCP egress ("" = none)
+	proxyCACert     string            // recording proxy's CA cert path (HTTPS verify)
+	webSearch       WebSearchOpts     // web_search tool backend selection (off by default)
+	// shellEnvFn supplies extra environment for this agent's Bash subprocesses, read per
+	// run so toggling the egress lockdown (S3) takes effect without a rebuild.
+	shellEnvFn     func() []string
+	lockdownFn     func() bool
+	workDir        string                                 // shared work dir (surfaced in prompt as artifact-output target)
+	steerWork      func(intentID int64, msg string) error // engine callback: steer a running work (nil = off)
+	nonStreamingFn func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
+	noaEnabledFn   func() bool                            // resolver: use experimental noa compaction? (nil = off)
+	maxTokensFn    func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
 }
 
 // SetNoaEnabled wires a resolver deciding whether runs use the experimental noa
@@ -71,8 +76,35 @@ func (m *MainAgent) compactionWindow() int {
 }
 
 // SetProxy points the main agent's WebFetch at the recording proxy plus the CA
-// cert it trusts to verify HTTPS through it (empty addr = direct).
-func (m *MainAgent) SetProxy(addr, caCert string) { m.proxyAddr, m.proxyCACert = addr, caCert }
+// cert it trusts to verify HTTPS through it, and at the same listener's SOCKS5
+// endpoint so non-HTTP tooling leaves through the same egress (empty = direct).
+func (m *MainAgent) SetProxy(addr, caCert, socksAddr string) {
+	m.proxyAddr, m.proxyCACert, m.socksAddr = addr, caCert, socksAddr
+}
+
+// shellEnv returns this agent's per-run shell environment (nil = nothing extra).
+func (m *MainAgent) shellEnv() []string {
+	if m.shellEnvFn == nil {
+		return nil
+	}
+	return m.shellEnvFn()
+}
+
+// SetShellEnv supplies extra environment for this agent's Bash subprocesses (S3).
+func (m *MainAgent) SetShellEnv(fn func() []string) { m.shellEnvFn = fn }
+
+// lockdown reports whether the kernel confines this agent's egress. Defaults to
+// false when unwired, so a missing hook injects the proxy variables (recorded)
+// rather than letting commands leave unrecorded.
+func (m *MainAgent) lockdown() bool {
+	if m.lockdownFn == nil {
+		return false
+	}
+	return m.lockdownFn()
+}
+
+// SetEgressLockdown wires the live confinement state for this agent (S3).
+func (m *MainAgent) SetEgressLockdown(fn func() bool) { m.lockdownFn = fn }
 
 // SetWebSearch selects the web_search backend for the main agent (off by default).
 func (m *MainAgent) SetWebSearch(o WebSearchOpts) { m.webSearch = o }
@@ -153,8 +185,8 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		DeepSeekSearchAPIKey:  m.webSearch.DeepSeekAPIKey,
 		DeepSeekSearchModel:   m.webSearch.DeepSeekModel,
 		WebSearchProxy:        m.webSearch.Proxy,
-		BashEnv:               proxyEnv(m.proxyAddr, m.proxyCACert), // Bash 子命令默认走代理+信任 CA
-		WorkingDir:            mainDir,                              // 本任务工作目录 <workDir>/tasks/<taskID>
+		BashEnv:               append(bashEnv(m.proxyAddr, m.proxyCACert, m.socksAddr, m.lockdown()), m.shellEnv()...), // Bash 子命令默认走代理+信任 CA
+		WorkingDir:            mainDir,                                                                                 // 本任务工作目录 <workDir>/tasks/<taskID>
 		ToolOutputDir:         cmdOutDir(mainDir),
 		MaxTurns:              m.maxTurns,                             // 0 = unlimited (configurable in agent management)
 		Compaction:            compactionConfig(m.compactionWindow()), // long chats stay within the window
